@@ -1,0 +1,3 @@
+maxapi
+asyncpg
+python-dotenv
