@@ -1,6 +1,6 @@
-"""Модуль для работы с базой данных"""
+"""Модуль для работы с базой данных MySQL"""
 import asyncio
-import asyncpg
+import aiomysql
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
@@ -12,113 +12,101 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """Асинхронный класс для работы с PostgreSQL"""
+    """Асинхронный класс для работы с MySQL"""
     
     def __init__(self):
-        self.pool: Optional[asyncpg.Pool] = None
+        self.pool = None
     
     async def connect(self):
         """Создание пула соединений"""
         try:
-            self.pool = await asyncpg.create_pool(
+            self.pool = await aiomysql.create_pool(
                 host=config.db.host,
                 port=config.db.port,
-                database=config.db.name,
+                db=config.db.name,
                 user=config.db.user,
                 password=config.db.password,
-                min_size=2,
-                max_size=10
+                minsize=2,
+                maxsize=10,
+                autocommit=True,
+                charset='utf8mb4'
             )
-            logger.info("✅ Database connection pool created")
+            logger.info("✅ MySQL connection pool created")
             await self.init_schema()
         except Exception as e:
-            logger.error(f"❌ Database connection failed: {e}")
+            logger.error(f"❌ MySQL connection failed: {e}")
             raise
     
     async def close(self):
         """Закрытие пула соединений"""
         if self.pool:
-            await self.pool.close()
-            logger.info("Database connection pool closed")
+            self.pool.close()
+            await self.pool.wait_closed()
+            logger.info("MySQL connection pool closed")
     
     async def init_schema(self):
         """Инициализация схемы базы данных"""
         async with self.pool.acquire() as conn:
-            # Сначала удаляем старые таблицы (если нужно с чистого листа)
-            # await conn.execute("DROP TABLE IF EXISTS registrations")
-            # await conn.execute("DROP TABLE IF EXISTS users")
-            
-            # Таблица пользователей
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT UNIQUE NOT NULL,
-                    chat_id BIGINT,
-                    name VARCHAR(255),
-                    phone VARCHAR(20),
-                    inn VARCHAR(12),
-                    state VARCHAR(50) DEFAULT 'awaiting_phone',
-                    registration_status VARCHAR(50) DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    registered_at TIMESTAMP
-                )
-            """)
-            logger.info("✅ Table 'users' created/verified")
-            
-            # Таблица регистраций
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS registrations (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    chat_id BIGINT,
-                    name VARCHAR(255) NOT NULL,
-                    phone VARCHAR(20) NOT NULL,
-                    inn VARCHAR(12) NOT NULL,
-                    event_name VARCHAR(255) NOT NULL,
-                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status VARCHAR(50) DEFAULT 'active'
-                )
-            """)
-            logger.info("✅ Table 'registrations' created/verified")
-            
-            # Проверяем существование колонок перед созданием индексов
-            # Проверяем колонку user_id в таблице users
-            columns = await conn.fetch("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'users'
-            """)
-            column_names = [col['column_name'] for col in columns]
-            
-            if 'user_id' in column_names:
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)"
-                )
-                logger.info("✅ Index 'idx_users_user_id' created")
-            
-            # Индекс для ИНН в регистрациях
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_registrations_inn ON registrations(inn)"
-            )
-            logger.info("✅ Index 'idx_registrations_inn' created")
-            
-            # Индекс для даты регистрации
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_registrations_date ON registrations(registration_date)"
-            )
-            logger.info("✅ Index 'idx_registrations_date' created")
-            
-            logger.info("✅ Database schema initialized successfully")
+            async with conn.cursor() as cur:
+                # Таблица пользователей
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id BIGINT UNIQUE NOT NULL,
+                        chat_id BIGINT,
+                        name VARCHAR(255),
+                        phone VARCHAR(20),
+                        inn VARCHAR(12),
+                        state VARCHAR(50) DEFAULT 'awaiting_phone',
+                        registration_status VARCHAR(50) DEFAULT 'pending',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        registered_at TIMESTAMP NULL
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                logger.info("✅ Table 'users' created/verified")
+                
+                # Таблица регистраций
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS registrations (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        chat_id BIGINT,
+                        name VARCHAR(255) NOT NULL,
+                        phone VARCHAR(20) NOT NULL,
+                        inn VARCHAR(12) NOT NULL,
+                        event_name VARCHAR(255) NOT NULL,
+                        registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status VARCHAR(50) DEFAULT 'active',
+                        INDEX idx_user_id (user_id),
+                        INDEX idx_inn (inn),
+                        INDEX idx_registration_date (registration_date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                logger.info("✅ Table 'registrations' created/verified")
+                
+                # Индексы для users
+                try:
+                    await cur.execute("CREATE INDEX idx_users_user_id ON users(user_id)")
+                except Exception:
+                    pass  # Индекс уже существует
+                
+                try:
+                    await cur.execute("CREATE INDEX idx_users_state ON users(state)")
+                except Exception:
+                    pass
+                
+                logger.info("✅ Database schema initialized successfully")
     
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Получение пользователя по ID"""
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1",
-                user_id
-            )
-            return dict(row) if row else None
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT * FROM users WHERE user_id = %s",
+                    (user_id,)
+                )
+                return await cur.fetchone()
     
     async def save_user(
         self,
@@ -132,36 +120,54 @@ class Database:
     ) -> int:
         """Сохранение или обновление пользователя"""
         async with self.pool.acquire() as conn:
-            # Проверяем существование пользователя
-            existing = await conn.fetchval(
-                "SELECT id FROM users WHERE user_id = $1",
-                user_id
-            )
-            
-            if existing:
-                # Обновляем существующего
-                result = await conn.fetchval("""
-                    UPDATE users 
-                    SET 
-                        chat_id = COALESCE($2, users.chat_id),
-                        name = COALESCE($3, users.name),
-                        phone = COALESCE($4, users.phone),
-                        inn = COALESCE($5, users.inn),
-                        state = COALESCE($6, users.state),
-                        registration_status = COALESCE($7, users.registration_status),
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = $1
-                    RETURNING id
-                """, user_id, chat_id, name, phone, inn, state, status)
-                return result
-            else:
-                # Создаем нового
-                result = await conn.fetchval("""
-                    INSERT INTO users (user_id, chat_id, name, phone, inn, state, registration_status)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    RETURNING id
-                """, user_id, chat_id, name, phone, inn, state, status or 'pending')
-                return result
+            async with conn.cursor() as cur:
+                # Проверяем существование пользователя
+                await cur.execute(
+                    "SELECT id FROM users WHERE user_id = %s",
+                    (user_id,)
+                )
+                existing = await cur.fetchone()
+                
+                if existing:
+                    # Обновляем существующего
+                    updates = []
+                    params = []
+                    
+                    if chat_id is not None:
+                        updates.append("chat_id = %s")
+                        params.append(chat_id)
+                    if name is not None:
+                        updates.append("name = %s")
+                        params.append(name)
+                    if phone is not None:
+                        updates.append("phone = %s")
+                        params.append(phone)
+                    if inn is not None:
+                        updates.append("inn = %s")
+                        params.append(inn)
+                    if state is not None:
+                        updates.append("state = %s")
+                        params.append(state)
+                    if status is not None:
+                        updates.append("registration_status = %s")
+                        params.append(status)
+                    
+                    if updates:
+                        params.append(user_id)
+                        await cur.execute(
+                            f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s",
+                            params
+                        )
+                    
+                    return existing[0]
+                else:
+                    # Создаем нового
+                    await cur.execute("""
+                        INSERT INTO users (user_id, chat_id, name, phone, inn, state, registration_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (user_id, chat_id, name, phone, inn, state, status or 'pending'))
+                    
+                    return cur.lastrowid
     
     async def save_registration(
         self,
@@ -174,51 +180,61 @@ class Database:
     ) -> int:
         """Сохранение регистрации"""
         async with self.pool.acquire() as conn:
-            # Сохраняем регистрацию
-            reg_id = await conn.fetchval("""
-                INSERT INTO registrations (user_id, chat_id, name, phone, inn, event_name)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """, user_id, chat_id, name, phone, inn, event_name)
-            
-            # Обновляем статус пользователя
-            await conn.execute("""
-                UPDATE users 
-                SET registration_status = 'completed',
-                    registered_at = CURRENT_TIMESTAMP,
-                    state = 'registered',
-                    inn = $2
-                WHERE user_id = $1
-            """, user_id, inn)
-            
-            return reg_id
+            async with conn.cursor() as cur:
+                # Сохраняем регистрацию
+                await cur.execute("""
+                    INSERT INTO registrations (user_id, chat_id, name, phone, inn, event_name)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (user_id, chat_id, name, phone, inn, event_name))
+                
+                reg_id = cur.lastrowid
+                
+                # Обновляем статус пользователя
+                await cur.execute("""
+                    UPDATE users 
+                    SET registration_status = 'completed',
+                        registered_at = NOW(),
+                        state = 'registered',
+                        inn = %s
+                    WHERE user_id = %s
+                """, (inn, user_id))
+                
+                return reg_id
     
     async def check_inn_exists(self, inn: str) -> bool:
         """Проверка существования ИНН"""
         async with self.pool.acquire() as conn:
-            exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM registrations WHERE inn = $1)",
-                inn
-            )
-            return exists
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM registrations WHERE inn = %s LIMIT 1",
+                    (inn,)
+                )
+                result = await cur.fetchone()
+                return result is not None
     
     async def get_stats(self) -> Dict[str, Any]:
         """Получение статистики"""
         async with self.pool.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM registrations")
-            completed = await conn.fetchval(
-                "SELECT COUNT(*) FROM users WHERE registration_status = 'completed'"
-            )
-            pending = await conn.fetchval(
-                "SELECT COUNT(*) FROM users WHERE registration_status = 'pending'"
-            )
-            
-            return {
-                "total_registrations": total,
-                "completed": completed,
-                "pending": pending,
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM registrations")
+                total = (await cur.fetchone())[0]
+                
+                await cur.execute(
+                    "SELECT COUNT(*) FROM users WHERE registration_status = 'completed'"
+                )
+                completed = (await cur.fetchone())[0]
+                
+                await cur.execute(
+                    "SELECT COUNT(*) FROM users WHERE registration_status = 'pending'"
+                )
+                pending = (await cur.fetchone())[0]
+                
+                return {
+                    "total_registrations": total,
+                    "completed": completed,
+                    "pending": pending,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
 
 
 # Для отладки
@@ -231,12 +247,10 @@ async def test_connection():
         
         # Проверяем таблицы
         async with db.pool.acquire() as conn:
-            tables = await conn.fetch("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-            """)
-            print(f"Tables: {[t['table_name'] for t in tables]}")
+            async with conn.cursor() as cur:
+                await cur.execute("SHOW TABLES")
+                tables = await cur.fetchall()
+                print(f"Tables: {[t[0] for t in tables]}")
         
         await db.close()
     except Exception as e:

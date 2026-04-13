@@ -10,9 +10,9 @@ load_dotenv()
 class DatabaseConfig:
     """Конфигурация базы данных"""
     host: str = field(default_factory=lambda: os.getenv('DB_HOST', 'localhost'))
-    port: int = field(default_factory=lambda: int(os.getenv('DB_PORT', '5432')))
+    port: int = field(default_factory=lambda: int(os.getenv('DB_PORT', '3306')))
     name: str = field(default_factory=lambda: os.getenv('DB_NAME', 'max_bot'))
-    user: str = field(default_factory=lambda: os.getenv('DB_USER', 'postgres'))
+    user: str = field(default_factory=lambda: os.getenv('DB_USER', 'root'))
     password: str = field(default_factory=lambda: os.getenv('DB_PASSWORD', ''))
 
 
