@@ -6,11 +6,75 @@ from datetime import datetime
 import logging
 import traceback
 from functools import wraps
+from logging.handlers import RotatingFileHandler
+import os
 
 from config import AppConfig
 
 config = AppConfig()
-logger = logging.getLogger(__name__)
+
+# Настройка ротации логов для базы данных
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Создаем отдельный логгер для базы данных
+db_logger = logging.getLogger('database')
+db_logger.setLevel(logging.DEBUG)
+
+# Очищаем существующие хендлеры
+db_logger.handlers.clear()
+
+# Форматтер для логов
+log_format = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Файловый хендлер с ротацией для БД
+db_log_file = os.path.join(log_dir, "database.log")
+db_file_handler = RotatingFileHandler(
+    db_log_file,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,
+    encoding='utf-8'
+)
+db_file_handler.setLevel(logging.DEBUG)
+db_file_handler.setFormatter(log_format)
+db_logger.addHandler(db_file_handler)
+
+# Файловый хендлер для ошибок БД
+db_error_log_file = os.path.join(log_dir, "database_error.log")
+db_error_handler = RotatingFileHandler(
+    db_error_log_file,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,
+    encoding='utf-8'
+)
+db_error_handler.setLevel(logging.ERROR)
+db_error_handler.setFormatter(log_format)
+db_logger.addHandler(db_error_handler)
+
+# Консольный хендлер (опционально, можно закомментировать если не нужен)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(log_format)
+db_logger.addHandler(console_handler)
+
+# Запрещаем propagation чтобы не дублировать логи в корневой логгер
+db_logger.propagate = False
+
+logger = db_logger
+
+# Логируем информацию о настройке логирования БД
+logger.info("=" * 60)
+logger.info("Database logging configuration:")
+logger.info(f"  Log directory: {log_dir}")
+logger.info(f"  Main log file: {db_log_file}")
+logger.info(f"  Error log file: {db_error_log_file}")
+logger.info(f"  Max log size: 10 MB")
+logger.info(f"  Backup count: 5")
+logger.info("=" * 60)
 
 
 def db_error_handler(func):
@@ -21,8 +85,10 @@ def db_error_handler(func):
         logger.debug(f"→ DB operation: {func_name}")
         
         try:
+            start_time = datetime.now()
             result = await func(*args, **kwargs)
-            logger.debug(f"← DB operation {func_name} completed successfully")
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.debug(f"← DB operation {func_name} completed successfully in {elapsed:.3f}s")
             return result
         except aiomysql.Error as e:
             logger.error(f"✗ MySQL Error in {func_name}: {e}\n{traceback.format_exc()}")
@@ -44,6 +110,8 @@ class Database:
         self.pool = None
         self.connection_attempts = 0
         self.max_connection_attempts = 3
+        self.query_count = 0
+        self.error_count = 0
         logger.debug("Database instance created")
     
     async def connect(self):
@@ -82,9 +150,14 @@ class Database:
                 await self.init_schema()
                 
                 self.connection_attempts = 0
+                
+                # Логируем статистику пула
+                await self._log_pool_stats()
+                
                 return
                 
             except aiomysql.OperationalError as e:
+                self.error_count += 1
                 logger.error(f"❌ MySQL operational error (attempt {attempt}/{self.max_connection_attempts}): {e}")
                 if attempt < self.max_connection_attempts:
                     wait_time = attempt * 2
@@ -95,12 +168,23 @@ class Database:
                     raise
                     
             except aiomysql.Error as e:
+                self.error_count += 1
                 logger.error(f"❌ MySQL connection failed: {e}\n{traceback.format_exc()}")
                 raise
                 
             except Exception as e:
+                self.error_count += 1
                 logger.error(f"❌ Unexpected error during connection: {e}\n{traceback.format_exc()}")
                 raise
+    
+    async def _log_pool_stats(self):
+        """Логирование статистики пула соединений"""
+        try:
+            if self.pool:
+                pool_size = len(self.pool._pool) if hasattr(self.pool, '_pool') else "unknown"
+                logger.info(f"📊 Pool stats - size: {pool_size}, queries: {self.query_count}, errors: {self.error_count}")
+        except Exception as e:
+            logger.debug(f"Could not log pool stats: {e}")
     
     async def _test_connection(self):
         """Тестирование соединения с базой данных"""
@@ -129,6 +213,10 @@ class Database:
         
         if self.pool:
             try:
+                # Логируем финальную статистику
+                await self._log_pool_stats()
+                logger.info(f"📊 Final stats - Total queries: {self.query_count}, Total errors: {self.error_count}")
+                
                 self.pool.close()
                 await self.pool.wait_closed()
                 logger.info("✅ MySQL connection pool closed successfully")
@@ -145,6 +233,8 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
+                
                 # Проверяем существование базы данных
                 logger.debug("Checking database existence...")
                 
@@ -229,6 +319,7 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
                 await cur.execute(
                     "SELECT * FROM users WHERE user_id = %s",
                     (user_id,)
@@ -237,11 +328,6 @@ class Database:
                 
                 if user:
                     logger.debug(f"User {user_id} found in database (status: {user.get('registration_status')})")
-                    # Маскируем чувствительные данные в логах
-                    if user.get('phone'):
-                        user['phone'] = f"{user['phone'][:4]}****" if len(user['phone']) > 4 else "****"
-                    if user.get('inn'):
-                        user['inn'] = f"{user['inn'][:4]}****" if len(user['inn']) > 4 else "****"
                 else:
                     logger.debug(f"User {user_id} not found in database")
                 
@@ -269,6 +355,8 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
+                
                 # Проверяем существование пользователя
                 await cur.execute(
                     "SELECT id FROM users WHERE user_id = %s",
@@ -346,6 +434,8 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
+                
                 # Проверяем, не зарегистрирован ли уже пользователь
                 await cur.execute(
                     "SELECT id FROM registrations WHERE user_id = %s AND event_name = %s",
@@ -395,6 +485,7 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
                 await cur.execute(
                     "SELECT 1 FROM registrations WHERE inn = %s LIMIT 1",
                     (inn,)
@@ -416,6 +507,8 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
+                
                 # Общее количество регистраций
                 await cur.execute("SELECT COUNT(*) FROM registrations")
                 total = (await cur.fetchone())[0]
@@ -466,6 +559,8 @@ class Database:
                     "state_distribution": [
                         {"state": s[0], "count": s[1]} for s in state_stats
                     ],
+                    "db_queries": self.query_count,
+                    "db_errors": self.error_count,
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 
@@ -479,6 +574,7 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
                 await cur.execute(
                     "SELECT user_id, name, state, created_at FROM users WHERE state = %s",
                     (state,)
@@ -494,6 +590,7 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
                 await cur.execute("""
                     DELETE FROM users 
                     WHERE registration_status = 'pending' 
@@ -511,6 +608,8 @@ class Database:
         
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
+                self.query_count += 1
+                
                 # Проверяем соединение
                 await cur.execute("SELECT 1")
                 await cur.fetchone()
@@ -536,11 +635,40 @@ class Database:
                         {"name": t[0], "size_mb": t[1]} for t in tables_size
                     ],
                     "connections": int(threads[1]) if threads else 0,
+                    "queries_executed": self.query_count,
+                    "errors_count": self.error_count,
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 
                 logger.debug(f"Health check completed: {health['status']}")
                 return health
+    
+    def get_log_files_info(self) -> Dict[str, Any]:
+        """Получение информации о лог-файлах базы данных"""
+        try:
+            log_files = []
+            total_size = 0
+            
+            for f in os.listdir(log_dir):
+                if 'database' in f and f.endswith('.log'):
+                    file_path = os.path.join(log_dir, f)
+                    size = os.path.getsize(file_path)
+                    total_size += size
+                    log_files.append({
+                        'name': f,
+                        'size': size,
+                        'size_mb': round(size / (1024 * 1024), 2)
+                    })
+            
+            return {
+                'log_directory': log_dir,
+                'files': sorted(log_files, key=lambda x: x['name']),
+                'total_size_mb': round(total_size / (1024 * 1024), 2),
+                'total_files': len(log_files)
+            }
+        except Exception as e:
+            logger.error(f"Error getting log files info: {e}")
+            return {'error': str(e)}
 
 
 # Для отладки
@@ -570,12 +698,22 @@ async def test_connection():
         print(f"Total registrations: {stats['total_registrations']}")
         print(f"Completed: {stats['completed']}")
         print(f"Pending: {stats['pending']}")
+        print(f"DB Queries: {stats['db_queries']}")
+        print(f"DB Errors: {stats['db_errors']}")
         
         print("\n🏥 Health check...")
         health = await db.health_check()
         print(f"Status: {health['status']}")
         print(f"Pool size: {health['pool_size']}")
         print(f"Active connections: {health['connections']}")
+        
+        print("\n📁 Log files info...")
+        log_info = db.get_log_files_info()
+        print(f"Log directory: {log_info['log_directory']}")
+        print(f"Total files: {log_info['total_files']}")
+        print(f"Total size: {log_info['total_size_mb']} MB")
+        for log_file in log_info['files']:
+            print(f"  - {log_file['name']}: {log_file['size_mb']} MB")
         
         await db.close()
         print("\n✅ Test completed successfully!")
