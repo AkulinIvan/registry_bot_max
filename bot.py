@@ -8,7 +8,9 @@ from dataclasses import dataclass
 
 from maxapi import Bot, Dispatcher, F
 from maxapi.types import MessageCreated, Command
-from maxapi.types.updates import BotAdded, BotStarted
+from maxapi.types.updates import BotStarted
+from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+from maxapi.types.attachments.buttons import RequestContactButton
 
 from config import AppConfig
 from database import Database
@@ -108,6 +110,41 @@ def get_message_text(event: MessageCreated) -> Optional[str]:
     return None
 
 
+def extract_phone_from_message(message) -> Optional[str]:
+    """Извлечение номера телефона из сообщения"""
+    # Логируем структуру сообщения для отладки
+    logger.info(f"Message dir: {[attr for attr in dir(message) if not attr.startswith('_')]}")
+    
+    # Проверяем разные возможные места хранения контакта
+    if hasattr(message, 'contact'):
+        contact = message.contact
+        logger.info(f"Contact found: {contact}")
+        if hasattr(contact, 'phone_number'):
+            return contact.phone_number
+        if hasattr(contact, 'phone'):
+            return contact.phone
+    
+    if hasattr(message, 'body'):
+        body = message.body
+        if hasattr(body, 'contact'):
+            contact = body.contact
+            if hasattr(contact, 'phone_number'):
+                return contact.phone_number
+    
+    return None
+
+
+def create_phone_keyboard():
+    """Создание клавиатуры с кнопкой для отправки номера телефона"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        RequestContactButton(
+            text="📱 Поделиться номером телефона"
+        )
+    )
+    return builder.as_markup()
+
+
 # ============= Обработчики команд =============
 
 @dp.message_created(Command('start'))
@@ -128,60 +165,15 @@ async def start_command(event: MessageCreated):
     )
     user_states[user_id] = 'awaiting_phone'
     
+    keyboard = create_phone_keyboard()
+    
     await event.message.answer(
-        f"👋 Здравствуйте, {user_name}!\n\n"
-        f"Для регистрации на {config.bot.event_name}, "
-        "пожалуйста, отправьте свой номер телефона.\n\n"
-        "📱 Формат: +7 999 123-45-67"
+        "👋 Добро пожаловать!\n\n"
+        "Вы можете зарегистрироваться на наше мероприятие прямо здесь.\n\n"
+        "Нажмите кнопку ниже, чтобы поделиться своим номером телефона "
+        "и подтвердить участие. Это займёт всего несколько секунд!",
+        attachments=[keyboard]
     )
-
-
-@dp.message_created(Command('help'))
-async def help_command(event: MessageCreated):
-    """Команда /help"""
-    await event.message.answer(
-        "📋 Помощь по боту\n\n"
-        "/start - начать регистрацию\n"
-        "/help - показать эту справку\n"
-        "/status - проверить статус регистрации\n\n"
-        f"Мероприятие: {config.bot.event_name}"
-    )
-
-
-@dp.message_created(Command('status'))
-async def status_command(event: MessageCreated):
-    """Команда /status"""
-    user_id = get_user_id(event)
-    user = await db.get_user(user_id)
-    
-    if not user:
-        await event.message.answer(
-            "Вы еще не начинали регистрацию.\n"
-            "Используйте /start чтобы начать."
-        )
-        return
-    
-    status = user.get('registration_status', 'pending')
-    
-    if status == 'completed':
-        inn = user.get('inn', 'не указан')
-        await event.message.answer(
-            f"✅ Вы зарегистрированы!\n\n"
-            f"Мероприятие: {config.bot.event_name}\n"
-            f"ИНН: {inn[:4]}****{inn[-2:] if len(inn) >= 6 else ''}"
-        )
-    else:
-        state = user.get('state', 'awaiting_phone')
-        if state == 'awaiting_phone':
-            await event.message.answer(
-                "⏳ Ожидается ввод номера телефона.\n"
-                "Отправьте номер в формате +7 999 123-45-67"
-            )
-        elif state == 'awaiting_inn':
-            await event.message.answer(
-                "⏳ Ожидается ввод ИНН.\n"
-                "Отправьте ИНН (10 цифр для организации, 12 для ИП)"
-            )
 
 
 # ============= Обработчики обновлений =============
@@ -192,53 +184,49 @@ async def bot_started_handler(event: BotStarted):
     logger.info(f"Bot started by user {event.user.user_id}")
     
     try:
+        keyboard = create_phone_keyboard()
         await bot.send_message(
             user_id=event.user.user_id,
             text=(
-                f"👋 Бот для регистрации на {config.bot.event_name} запущен!\n\n"
-                "Используйте команду /start для начала регистрации."
-            )
+                "👋 Добро пожаловать!\n\n"
+                "Вы можете зарегистрироваться на наше мероприятие прямо здесь.\n\n"
+                "Нажмите кнопку ниже, чтобы поделиться своим номером телефона "
+                "и подтвердить участие. Это займёт всего несколько секунд!"
+            ),
+            attachments=[keyboard]
         )
     except Exception as e:
         logger.error(f"Failed to send bot_started message: {e}")
 
 
-@dp.bot_added()
-async def bot_added_handler(event: BotAdded):
-    """Бот добавлен в чат"""
-    logger.info(f"Bot added to chat {event.chat_id}")
-    
-    try:
-        await bot.send_message(
-            chat_id=event.chat_id,
-            text=(
-                f"👋 Спасибо, что добавили меня!\n\n"
-                f"Я бот для регистрации на {config.bot.event_name}.\n"
-                "Используйте команду /start для начала регистрации."
-            )
-        )
-    except Exception as e:
-        logger.error(f"Failed to send bot_added message: {e}")
+# ============= Основной обработчик сообщений =============
 
-
-# ============= Обработчики сообщений =============
-
-@dp.message_created(F.message.body.text)
-async def handle_message(event: MessageCreated):
-    """Обработка текстовых сообщений"""
+@dp.message_created()
+async def handle_all_messages(event: MessageCreated):
+    """Обработка всех сообщений"""
     user_id = get_user_id(event)
-    text = get_message_text(event)
     user_name = get_user_name(event)
     chat_id = get_chat_id(event)
+    
+    logger.info(f"Message from user {user_id}")
+    
+    # Получаем текст сообщения
+    text = get_message_text(event)
+    
+    # Пробуем извлечь телефон из контакта
+    phone = extract_phone_from_message(event.message)
+    if phone:
+        logger.info(f"Contact phone extracted: {phone}")
     
     # Игнорируем команды
     if text and text.startswith('/'):
         return
     
+    # Получаем пользователя из БД
     user = await db.get_user(user_id)
     
+    # Если пользователь не найден - создаем
     if not user:
-        # Новый пользователь
         await db.save_user(
             user_id=user_id,
             chat_id=chat_id,
@@ -247,28 +235,43 @@ async def handle_message(event: MessageCreated):
             status='pending'
         )
         user_states[user_id] = 'awaiting_phone'
+        
+        keyboard = create_phone_keyboard()
         await event.message.answer(
-            f"👋 Здравствуйте, {user_name}!\n\n"
-            "Отправьте ваш номер телефона для регистрации.\n"
-            "Формат: +7 999 123-45-67"
+            "👋 Добро пожаловать!\n\n"
+            "Нажмите кнопку ниже, чтобы поделиться номером телефона "
+            "или отправьте его вручную в формате: +7 999 123-45-67",
+            attachments=[keyboard]
         )
         return
     
+    # Если уже зарегистрирован
     if user.get('registration_status') == 'completed':
         await event.message.answer(
             "✅ Вы уже зарегистрированы!\n"
-            "Используйте /status для просмотра информации."
+            "До встречи на мероприятии!"
         )
         return
     
     state = user.get('state') or user_states.get(user_id, 'awaiting_phone')
+    logger.info(f"User {user_id} state: {state}")
     
+    # Обработка состояния ожидания телефона
     if state == 'awaiting_phone':
-        validated = validate_phone(text)
+        # Если есть контакт - используем его
+        if phone:
+            validated = validate_phone(phone)
+        elif text:
+            validated = validate_phone(text)
+        else:
+            validated = None
+        
         if not validated:
+            keyboard = create_phone_keyboard()
             await event.message.answer(
                 "❌ Неверный формат номера.\n"
-                "Отправьте номер в формате: +7 999 123-45-67"
+                "Нажмите кнопку ниже или отправьте номер в формате: +7 999 123-45-67",
+                attachments=[keyboard]
             )
             return
         
@@ -280,18 +283,30 @@ async def handle_message(event: MessageCreated):
         )
         user_states[user_id] = 'awaiting_inn'
         
+        await event.message.answer("🔄 Регистрируем вас...")
+        
         await event.message.answer(
-            f"✅ Номер {validated.formatted} принят!\n\n"
-            "Теперь отправьте ИНН:\n"
+            "📋 Отлично! Теперь отправьте ваш ИНН:\n"
             "• 10 цифр для организации\n"
             "• 12 цифр для ИП"
         )
+        return
     
+    # Обработка состояния ожидания ИНН
     elif state == 'awaiting_inn':
+        if not text:
+            await event.message.answer(
+                "📋 Пожалуйста, отправьте ИНН текстом:\n"
+                "• 10 цифр для организации\n"
+                "• 12 цифр для ИП"
+            )
+            return
+        
         validated = validate_inn(text)
         if not validated:
             await event.message.answer(
-                "❌ Неверный ИНН. Должно быть 10 или 12 цифр."
+                "❌ Неверный ИНН. Должно быть 10 или 12 цифр.\n"
+                "Попробуйте ещё раз:"
             )
             return
         
@@ -314,24 +329,19 @@ async def handle_message(event: MessageCreated):
         if user_id in user_states:
             del user_states[user_id]
         
-        inn_type = "организации" if validated.type == 'organization' else "ИП"
-        
         await event.message.answer(
-            f"✅ Регистрация завершена!\n\n"
-            f"📋 ИНН {inn_type}: {validated.number}\n"
-            f"🔢 Номер регистрации: {reg_id}\n\n"
-            f"Спасибо за регистрацию на {config.bot.event_name}! 🎉"
+            "🎉 Отлично! Вы успешно зарегистрированы на мероприятие!\n\n"
+            "Мы свяжемся с вами по указанному номеру телефона. До встречи! 👋"
         )
         
-        logger.info(f"User {user_id} registered with INN: {validated.number[:4]}****")
-
-
-@dp.message_created()
-async def fallback_handler(event: MessageCreated):
-    """Обработчик для всех остальных сообщений"""
+        logger.info(f"User {user_id} registered successfully")
+        return
+    
+    # Fallback
+    keyboard = create_phone_keyboard()
     await event.message.answer(
-        "Используйте команду /start для начала регистрации\n"
-        "или /help для получения справки."
+        "👋 Используйте кнопку ниже для регистрации или отправьте /start",
+        attachments=[keyboard]
     )
 
 
@@ -345,7 +355,6 @@ async def main():
     
     await db.connect()
     
-    # Удаляем старые webhook подписки для polling
     try:
         await bot.delete_webhook()
         logger.info("Webhook subscriptions cleared")
