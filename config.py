@@ -1,6 +1,8 @@
 """Модуль конфигурации приложения"""
 import os
+import json
 from dataclasses import dataclass, field
+from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,9 +25,29 @@ class BotConfig:
     event_name: str = field(default_factory=lambda: os.getenv('EVENT_NAME', 'Дни предпринимательства'))
     log_level: str = field(default_factory=lambda: os.getenv('LOG_LEVEL', 'INFO'))
     environment: str = field(default_factory=lambda: os.getenv('ENVIRONMENT', 'development'))
-    admin_ids: list = field(default_factory=lambda: [
-        int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()
-    ])
+    admin_ids: List[int] = field(default_factory=lambda: BotConfig._parse_admin_ids())
+
+    @staticmethod
+    def _parse_admin_ids() -> List[int]:
+        """Парсинг списка ID администраторов из переменной окружения"""
+        admin_ids_str = os.getenv('ADMIN_IDS', '[]')
+        try:
+            # Пробуем распарсить как JSON
+            admin_ids = json.loads(admin_ids_str)
+            if isinstance(admin_ids, list):
+                return [int(id) for id in admin_ids]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # Если не JSON, пробуем распарсить как строку с запятыми
+            if admin_ids_str and admin_ids_str != '[]':
+                try:
+                    return [int(id.strip()) for id in admin_ids_str.split(',') if id.strip()]
+                except ValueError:
+                    pass
+        return []
+
+    def is_admin(self, user_id: int) -> bool:
+        """Проверка, является ли пользователь администратором"""
+        return user_id in self.admin_ids
 
 
 @dataclass(frozen=True)
@@ -36,8 +58,46 @@ class DadataConfig:
 
 
 @dataclass(frozen=True)
+class LoggingConfig:
+    """Конфигурация логирования"""
+    log_dir: str = field(default_factory=lambda: os.getenv('LOG_DIR', 'logs'))
+    max_log_size_mb: int = field(default_factory=lambda: int(os.getenv('MAX_LOG_SIZE_MB', '10')))
+    backup_count: int = field(default_factory=lambda: int(os.getenv('LOG_BACKUP_COUNT', '5')))
+    console_log_level: str = field(default_factory=lambda: os.getenv('CONSOLE_LOG_LEVEL', 'INFO'))
+    file_log_level: str = field(default_factory=lambda: os.getenv('FILE_LOG_LEVEL', 'DEBUG'))
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Основная конфигурация приложения"""
     bot: BotConfig = field(default_factory=BotConfig)
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     dadata: DadataConfig = field(default_factory=DadataConfig)
+
+    def __post_init__(self):
+        """Валидация конфигурации после инициализации"""
+        if not self.bot.token:
+            raise ValueError("MAX_BOT_TOKEN is required! Please set it in .env file")
+
+        if self.bot.environment not in ['development', 'production', 'testing']:
+            raise ValueError(f"Invalid ENVIRONMENT: {self.bot.environment}")
+
+        if self.bot.log_level not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
+            raise ValueError(f"Invalid LOG_LEVEL: {self.bot.log_level}")
+
+    def is_development(self) -> bool:
+        """Проверка, запущено ли приложение в режиме разработки"""
+        return self.bot.environment == 'development'
+
+    def is_production(self) -> bool:
+        """Проверка, запущено ли приложение в продакшн режиме"""
+        return self.bot.environment == 'production'
+
+    def get_log_file_path(self, name: str) -> str:
+        """Получение полного пути к лог-файлу"""
+        return os.path.join(self.logging.log_dir, f"{name}.log")
+
+    def get_max_log_size_bytes(self) -> int:
+        """Получение максимального размера лог-файла в байтах"""
+        return self.logging.max_log_size_mb * 1024 * 1024

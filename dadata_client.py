@@ -1,10 +1,12 @@
 """Модуль для работы с DaData API"""
+from datetime import datetime
 import logging
 import traceback
 from typing import Optional, Dict, Any
 from functools import wraps
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
+import sys
 import httpx
 
 from config import AppConfig
@@ -15,56 +17,139 @@ config = AppConfig()
 log_dir = "logs"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
+    print(f"Created log directory: {log_dir}")
 
+# Создаем отдельный логгер для DaData
 dadata_logger = logging.getLogger('dadata')
 dadata_logger.setLevel(logging.DEBUG)
+
+# Очищаем существующие хендлеры
 dadata_logger.handlers.clear()
 
+# Форматтер для логов
 log_format = logging.Formatter(
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# Основной файл логов с ротацией по размеру (10 MB)
 dadata_log_file = os.path.join(log_dir, "dadata.log")
 file_handler = RotatingFileHandler(
     dadata_log_file,
-    maxBytes=10 * 1024 * 1024,
-    backupCount=5,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,  # Хранить 5 бэкапов
     encoding='utf-8'
 )
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(log_format)
 dadata_logger.addHandler(file_handler)
 
-console_handler = logging.StreamHandler()
+# Файл для ошибок с ротацией по размеру
+dadata_error_log_file = os.path.join(log_dir, "dadata_error.log")
+error_handler = RotatingFileHandler(
+    dadata_error_log_file,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=10,  # Хранить 10 бэкапов ошибок
+    encoding='utf-8'
+)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(log_format)
+dadata_logger.addHandler(error_handler)
+
+# Дополнительный хендлер с ротацией по дням (для долгосрочного хранения)
+daily_log_file = os.path.join(log_dir, "dadata_daily.log")
+daily_handler = TimedRotatingFileHandler(
+    daily_log_file,
+    when='midnight',  # Ротация каждый день в полночь
+    interval=1,
+    backupCount=30,  # Хранить логи за 30 дней
+    encoding='utf-8'
+)
+daily_handler.setLevel(logging.INFO)
+daily_handler.setFormatter(log_format)
+dadata_logger.addHandler(daily_handler)
+
+# Консольный хендлер (только для важных сообщений)
+console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(log_format)
 dadata_logger.addHandler(console_handler)
 
+# Запрещаем propagation чтобы не дублировать логи в корневой логгер
 dadata_logger.propagate = False
 
 logger = dadata_logger
 
+# Логируем информацию о настройке логирования
+logger.info("=" * 60)
+logger.info("DaData logging configuration:")
+logger.info(f"  Log directory: {log_dir}")
+logger.info(f"  Main log file: {dadata_log_file}")
+logger.info(f"  Error log file: {dadata_error_log_file}")
+logger.info(f"  Daily log file: {daily_log_file}")
+logger.info(f"  Max log size: 10 MB")
+logger.info(f"  Backup count (size): 5")
+logger.info(f"  Backup count (daily): 30 days")
+logger.info(f"  Log levels - File: DEBUG, Console: INFO")
+logger.info(f"  API Key configured: {bool(config.dadata.api_key)}")
+logger.info(f"  Secret Key configured: {bool(config.dadata.secret_key)}")
+logger.info("=" * 60)
+
 
 def dadata_error_handler(func):
-    """Декоратор для обработки ошибок DaData API"""
+    """Декоратор для обработки ошибок DaData API с детальным логированием"""
     @wraps(func)
     async def wrapper(*args, **kwargs):
         func_name = func.__name__
         logger.debug(f"→ DaData API call: {func_name}")
+        
+        # Логируем аргументы (без чувствительных данных)
+        if args:
+            logger.debug(f"  Args: {args}")
+        if kwargs:
+            # Фильтруем чувствительные данные
+            safe_kwargs = {k: (v[:4] + '****' if 'inn' in k.lower() else v) 
+                          for k, v in kwargs.items()}
+            logger.debug(f"  Kwargs: {safe_kwargs}")
+        
         try:
+            import time
+            start_time = time.time()
+            
             result = await func(*args, **kwargs)
-            logger.debug(f"← DaData API call {func_name} completed")
+            
+            elapsed_time = time.time() - start_time
+            logger.debug(f"← DaData API call {func_name} completed in {elapsed_time:.3f}s")
+            
+            # Логируем результат (частично)
+            if result:
+                if isinstance(result, dict):
+                    safe_result = {
+                        'inn': result.get('inn', '')[:4] + '****' if result.get('inn') else None,
+                        'type': result.get('type'),
+                        'is_active': result.get('is_active'),
+                        'name': result.get('name', {}).get('short', 'Unknown')
+                    }
+                    logger.debug(f"  Result summary: {safe_result}")
+                else:
+                    logger.debug(f"  Result type: {type(result)}")
+            
             return result
+            
         except httpx.TimeoutException as e:
             logger.error(f"✗ DaData timeout in {func_name}: {e}")
+            logger.error(f"  Timeout details: Request exceeded time limit")
             raise
         except httpx.HTTPStatusError as e:
-            logger.error(f"✗ DaData HTTP error in {func_name}: {e.response.status_code} - {e.response.text}")
+            logger.error(f"✗ DaData HTTP error in {func_name}: {e.response.status_code}")
+            logger.error(f"  Response body: {e.response.text[:500]}")  # Первые 500 символов
+            logger.error(f"  Request URL: {e.request.url}")
             raise
         except Exception as e:
-            logger.error(f"✗ DaData unexpected error in {func_name}: {e}\n{traceback.format_exc()}")
+            logger.error(f"✗ DaData unexpected error in {func_name}: {e}")
+            logger.error(f"  Traceback:\n{traceback.format_exc()}")
             raise
+    
     return wrapper
 
 
@@ -78,7 +163,13 @@ class DadataClient:
         self.client = None
         self.request_count = 0
         self.error_count = 0
-        logger.info("DaData client initialized")
+        self.success_count = 0
+        self.total_response_time = 0
+        
+        if not self.api_key:
+            logger.warning("⚠️ DaData API key is not configured!")
+        else:
+            logger.info("DaData client initialized successfully")
     
     async def __aenter__(self):
         """Вход в контекстный менеджер"""
@@ -88,9 +179,10 @@ class DadataClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Authorization": f"Token {self.api_key}"
-            }
+            },
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
         )
-        logger.debug("HTTP client created")
+        logger.debug("HTTP client created with connection pool")
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -98,6 +190,40 @@ class DadataClient:
         if self.client:
             await self.client.aclose()
             logger.debug("HTTP client closed")
+        
+        # Логируем статистику использования
+        avg_response_time = self.total_response_time / max(self.success_count, 1)
+        logger.info(f"DaData session statistics - "
+                   f"Requests: {self.request_count}, "
+                   f"Success: {self.success_count}, "
+                   f"Errors: {self.error_count}, "
+                   f"Avg response time: {avg_response_time:.2f}s")
+    
+    async def _make_request(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
+        """Выполнение запроса с отслеживанием времени"""
+        import time
+        start_time = time.time()
+        
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/{endpoint}",
+                json=data
+            )
+            
+            elapsed_time = time.time() - start_time
+            self.total_response_time += elapsed_time
+            
+            response.raise_for_status()
+            self.success_count += 1
+            
+            logger.debug(f"Request to {endpoint} completed in {elapsed_time:.3f}s")
+            return response.json()
+            
+        except Exception as e:
+            self.error_count += 1
+            elapsed_time = time.time() - start_time
+            logger.error(f"Request to {endpoint} failed after {elapsed_time:.3f}s")
+            raise
     
     @dadata_error_handler
     async def find_company_by_inn(self, inn: str) -> Optional[Dict[str, Any]]:
@@ -108,13 +234,12 @@ class DadataClient:
         if not self.client:
             raise RuntimeError("Client not initialized. Use 'async with' context manager.")
         
+        if not inn or not inn.strip():
+            logger.warning("Empty INN provided")
+            return None
+        
         try:
-            response = await self.client.post(
-                f"{self.base_url}/findById/party",
-                json={"query": inn}
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = await self._make_request("findById/party", {"query": inn})
             
             if data.get("suggestions") and len(data["suggestions"]) > 0:
                 company = data["suggestions"][0]
@@ -125,7 +250,7 @@ class DadataClient:
                 return None
                 
         except Exception as e:
-            self.error_count += 1
+            logger.error(f"Failed to find company by INN {inn[:4]}****: {e}")
             raise
     
     @dadata_error_handler
@@ -138,12 +263,7 @@ class DadataClient:
             raise RuntimeError("Client not initialized. Use 'async with' context manager.")
         
         try:
-            response = await self.client.post(
-                f"{self.base_url}/findById/party",
-                json={"query": inn, "kpp": kpp}
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = await self._make_request("findById/party", {"query": inn, "kpp": kpp})
             
             if data.get("suggestions") and len(data["suggestions"]) > 0:
                 company = data["suggestions"][0]
@@ -154,7 +274,7 @@ class DadataClient:
                 return None
                 
         except Exception as e:
-            self.error_count += 1
+            logger.error(f"Failed to find company by INN+KPP: {e}")
             raise
     
     def _parse_company_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -206,12 +326,12 @@ class DadataClient:
                 "patronymic": data["fio"].get("patronymic", ""),
             }
         
-        logger.debug(f"Parsed company data: {parsed['type']} - {parsed['name']['short']}")
+        logger.debug(f"Parsed company data: {parsed['type']} - {parsed['name']['short']} (Active: {parsed['is_active']})")
         return parsed
     
-    async def get_balance(self) -> Optional[float]:
-        """Получение баланса DaData"""
-        logger.debug("Getting DaData balance")
+    async def get_balance(self) -> Optional[Dict[str, Any]]:
+        """Получение статистики использования DaData"""
+        logger.debug("Getting DaData statistics")
         
         if not self.client:
             raise RuntimeError("Client not initialized. Use 'async with' context manager.")
@@ -222,20 +342,77 @@ class DadataClient:
                 headers={"Authorization": f"Token {self.api_key}"}
             )
             response.raise_for_status()
-            # Баланс можно получить из заголовков ответа
-            return None  # DaData не предоставляет прямого метода для баланса
+            data = response.json()
+            logger.info(f"DaData daily stats retrieved")
+            return data
         except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
+            logger.error(f"Failed to get statistics: {e}")
             return None
     
     def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики использования"""
+        """Получение статистики использования клиента"""
+        avg_response_time = self.total_response_time / max(self.success_count, 1)
+        error_rate = (self.error_count / max(self.request_count, 1)) * 100
+        
         return {
             "request_count": self.request_count,
+            "success_count": self.success_count,
             "error_count": self.error_count,
+            "error_rate": f"{error_rate:.1f}%",
+            "avg_response_time": f"{avg_response_time:.3f}s",
             "api_key_configured": bool(self.api_key),
             "secret_key_configured": bool(self.secret_key)
         }
+    
+    @staticmethod
+    def cleanup_old_logs(days: int = 30):
+        """Очистка старых лог-файлов"""
+        try:
+            import time
+            from datetime import datetime, timedelta
+            
+            cutoff_time = time.time() - (days * 24 * 60 * 60)
+            
+            for filename in os.listdir(log_dir):
+                if filename.startswith('dadata') and filename.endswith('.log'):
+                    filepath = os.path.join(log_dir, filename)
+                    if os.path.getmtime(filepath) < cutoff_time:
+                        os.remove(filepath)
+                        logger.info(f"Removed old log file: {filename}")
+                        
+        except Exception as e:
+            logger.error(f"Error cleaning up old logs: {e}")
+    
+    @staticmethod
+    def get_log_files_info() -> Dict[str, Any]:
+        """Получение информации о лог-файлах"""
+        try:
+            log_files = []
+            total_size = 0
+            
+            for filename in os.listdir(log_dir):
+                if filename.startswith('dadata') and filename.endswith('.log'):
+                    filepath = os.path.join(log_dir, filename)
+                    size = os.path.getsize(filepath)
+                    total_size += size
+                    mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    
+                    log_files.append({
+                        'name': filename,
+                        'size_mb': round(size / (1024 * 1024), 2),
+                        'modified': mtime.strftime('%Y-%m-%d %H:%M:%S')
+                    })
+            
+            return {
+                'log_directory': log_dir,
+                'files': sorted(log_files, key=lambda x: x['name']),
+                'total_files': len(log_files),
+                'total_size_mb': round(total_size / (1024 * 1024), 2)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting log files info: {e}")
+            return {'error': str(e)}
 
 
 # Для тестирования
@@ -249,6 +426,7 @@ async def test_dadata():
     test_inns = [
         "7707083893",  # Сбербанк
         "7706107510",  # РЖД
+        "500100732259",  # ИП (пример)
     ]
     
     async with DadataClient() as client:
@@ -260,15 +438,32 @@ async def test_dadata():
                     print(f"  ✅ Found: {company['name']['short']}")
                     print(f"     Type: {company['type']}")
                     print(f"     Status: {company['state']['status']}")
-                    print(f"     Address: {company['address']['value'][:50]}...")
+                    print(f"     Active: {company['is_active']}")
+                    if company.get('address', {}).get('value'):
+                        addr = company['address']['value']
+                        print(f"     Address: {addr[:50]}..." if len(addr) > 50 else f"     Address: {addr}")
                 else:
                     print(f"  ❌ Not found")
             except Exception as e:
                 print(f"  ❌ Error: {e}")
             print()
         
+        print("\n📊 Statistics:")
         stats = client.get_stats()
-        print(f"Stats: {stats}")
+        for key, value in stats.items():
+            print(f"  {key}: {value}")
+        
+        print("\n📁 Log files info:")
+        log_info = client.get_log_files_info()
+        if 'error' not in log_info:
+            print(f"  Directory: {log_info['log_directory']}")
+            print(f"  Total files: {log_info['total_files']}")
+            print(f"  Total size: {log_info['total_size_mb']} MB")
+            for log_file in log_info['files']:
+                print(f"    - {log_file['name']}: {log_file['size_mb']} MB (modified: {log_file['modified']})")
+        
+        # Очистка старых логов (опционально)
+        # client.cleanup_old_logs(days=30)
 
 
 if __name__ == '__main__':
