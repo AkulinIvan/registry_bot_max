@@ -4,7 +4,7 @@ import logging
 import sys
 import re
 import traceback
-from typing import Optional
+from typing import Any, Dict, Optional
 from dataclasses import dataclass
 from functools import wraps
 from logging.handlers import RotatingFileHandler
@@ -18,6 +18,7 @@ from maxapi.types.attachments.buttons import RequestContactButton
 from maxapi.exceptions.max import MaxApiError
 
 from config import AppConfig
+from dadata_client import DadataClient
 from database import Database
 
 # Настройка логирования
@@ -172,9 +173,9 @@ def validate_phone(phone: str) -> Optional[ValidatedPhone]:
     return ValidatedPhone(number=clean, formatted=formatted)
 
 
-def validate_inn(inn: str) -> Optional[ValidatedINN]:
-    """Валидация ИНН"""
-    logger.debug(f"Validating INN: {inn[:4] if inn else 'empty'}****")
+async def validate_inn(inn: str) -> Optional[Dict[str, Any]]:
+    """Расширенная валидация ИНН через DaData API"""
+    logger.debug(f"Validating INN with DaData: {inn[:4] if inn else 'empty'}****")
     
     if not inn:
         logger.warning("INN validation failed: empty INN")
@@ -186,9 +187,48 @@ def validate_inn(inn: str) -> Optional[ValidatedINN]:
         logger.warning(f"INN validation failed: invalid format (len={len(clean)}, isdigit={clean.isdigit()})")
         return None
     
-    inn_type = 'organization' if len(clean) == 10 else 'individual'
-    logger.info(f"INN validated: type={inn_type}")
-    return ValidatedINN(number=clean, type=inn_type)
+    try:
+        async with DadataClient() as dadata:
+            company = await dadata.find_company_by_inn(clean)
+            
+            if company:
+                logger.info(f"✅ Company found via DaData: {company['name']['short']}")
+                
+                # Проверяем, активна ли компания
+                if not company['is_active']:
+                    logger.warning(f"Company {clean[:4]}**** is not active: {company['state']['status']}")
+                    return {
+                        "valid": False,
+                        "error": "company_inactive",
+                        "status": company['state']['status'],
+                        "company": company
+                    }
+                
+                return {
+                    "valid": True,
+                    "number": clean,
+                    "type": company['type'].lower(),
+                    "company": company
+                }
+            else:
+                logger.warning(f"INN {clean[:4]}**** not found in DaData")
+                return {
+                    "valid": False,
+                    "error": "not_found",
+                    "number": clean
+                }
+                
+    except Exception as e:
+        logger.error(f"DaData API error for INN {clean[:4]}****: {e}")
+        # Fallback: базовая валидация без DaData
+        inn_type = 'organization' if len(clean) == 10 else 'individual'
+        logger.info(f"Using fallback validation: INN type={inn_type}")
+        return {
+            "valid": True,
+            "number": clean,
+            "type": inn_type,
+            "fallback": True
+        }
 
 
 def get_user_id(event: MessageCreated) -> int:
@@ -667,19 +707,59 @@ async def handle_all_messages(event: MessageCreated):
             )
             return
         
-        validated = validate_inn(text)
-        if not validated:
-            logger.warning(f"Invalid INN format for user {user_id}")
-            await event.message.answer(
-                "❌ Неверный ИНН. Должно быть 10 или 12 цифр.\n"
-                "Попробуйте ещё раз:"
-            )
+        # Отправляем сообщение о проверке
+        checking_msg = await event.message.answer("🔍 Проверяем ИНН через базу ФНС...")
+        
+        # Расширенная валидация через DaData
+        validation_result = await validate_inn(text)
+        
+        if not validation_result or not validation_result.get("valid"):
+            error_type = validation_result.get("error") if validation_result else "invalid_format"
+            
+            if error_type == "company_inactive":
+                status = validation_result.get("status", "неизвестно")
+                company = validation_result.get("company", {})
+                await event.message.answer(
+                    f"⚠️ Компания с ИНН {text} имеет статус: {status}\n"
+                    f"📌 {company.get('name', {}).get('short', 'Неизвестно')}\n\n"
+                    "Регистрация возможна только для действующих организаций и ИП.\n"
+                    "Если это ошибка, свяжитесь с организаторами."
+                )
+            elif error_type == "not_found":
+                await event.message.answer(
+                    f"❌ ИНН {text} не найден в базе ФНС.\n"
+                    "Проверьте правильность ввода и попробуйте ещё раз:"
+                )
+            else:
+                await event.message.answer(
+                    "❌ Неверный ИНН. Должно быть 10 или 12 цифр.\n"
+                    "Попробуйте ещё раз:"
+                )
             return
         
+        validated_inn = validation_result["number"]
+        company_data = validation_result.get("company", {})
+        is_fallback = validation_result.get("fallback", False)
+        
+        if is_fallback:
+            logger.warning(f"Using fallback validation for INN {validated_inn[:4]}****")
+            await event.message.answer(
+                "⚠️ Временно недоступна проверка по базе ФНС.\n"
+                "ИНН принят, но рекомендуем проверить его корректность."
+            )
+        else:
+            # Показываем информацию о компании
+            company_info = f"✅ ИНН проверен: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
+            if company_data.get('address', {}).get('value'):
+                company_info += f"📍 {company_data['address']['value'][:100]}...\n"
+            company_info += f"📊 Статус: {'Действующая' if company_data.get('is_active') else company_data.get('state', {}).get('status', 'Неизвестно')}"
+            
+            await event.message.answer(company_info)
+        
         try:
-            inn_exists = await db.check_inn_exists(validated.number)
+            inn_exists = await db.check_inn_exists(validated_inn)
             if inn_exists:
-                logger.warning(f"INN already registered for user {user_id}: {validated.number[:4]}****")
+                logger.warning(f"INN already registered for user {user_id}: {validated_inn[:4]}****")
                 await event.message.answer(
                     "⚠️ Этот ИНН уже зарегистрирован.\n"
                     "Если это ошибка, свяжитесь с организаторами."
@@ -691,15 +771,21 @@ async def handle_all_messages(event: MessageCreated):
             return
         
         try:
+            # Сохраняем дополнительные данные компании если доступны
             reg_id = await db.save_registration(
                 user_id=user_id,
                 chat_id=chat_id,
                 name=user_name,
                 phone=user['phone'],
-                inn=validated.number,
+                inn=validated_inn,
                 event_name=config.bot.event_name
             )
             logger.info(f"Registration saved for user {user_id}, reg_id: {reg_id}")
+            
+            # Сохраняем данные компании в отдельную таблицу если нужно
+            if not is_fallback and company_data:
+                await db.save_company_data(user_id, company_data)
+                
         except Exception as e:
             logger.error(f"Failed to save registration for user {user_id}: {e}")
             await event.message.answer("❌ Ошибка сохранения регистрации. Попробуйте позже.")
@@ -709,12 +795,14 @@ async def handle_all_messages(event: MessageCreated):
             del user_states[user_id]
             logger.debug(f"User {user_id} removed from state memory")
         
-        await event.message.answer(
-            "🎉 Отлично! Вы успешно зарегистрированы на мероприятие!\n\n"
-            "Мы свяжемся с вами по указанному номеру телефона. До встречи! 👋"
-        )
+        success_message = "🎉 Отлично! Вы успешно зарегистрированы на мероприятие!\n\n"
+        if not is_fallback and company_data:
+            success_message += f"Организация: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
+        success_message += "\nМы свяжемся с вами по указанному номеру телефона. До встречи! 👋"
         
-        logger.info(f"✓ User {user_id} successfully registered with INN: {validated.number[:4]}****")
+        await event.message.answer(success_message)
+        
+        logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****")
         return
     
     # Fallback
@@ -725,7 +813,39 @@ async def handle_all_messages(event: MessageCreated):
         attachments=[keyboard]
     )
 
-
+@dp.message_created(Command('dadata_stats'))
+@safe_execute
+async def dadata_stats_command(event: MessageCreated):
+    """Команда для просмотра статистики DaData (только для админов)"""
+    user_id = get_user_id(event)
+    
+    # Проверяем, является ли пользователь админом
+    admin_ids = getattr(config.bot, 'admin_ids', [])
+    if user_id not in admin_ids:
+        logger.warning(f"Unauthorized access to /dadata_stats from user {user_id}")
+        await event.message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+    
+    try:
+        async with DadataClient() as dadata:
+            stats = dadata.get_stats()
+            
+            message = "📊 Статистика DaData API:\n\n"
+            message += f"🔑 API Key настроен: {'✅' if stats['api_key_configured'] else '❌'}\n"
+            message += f"🔐 Secret Key настроен: {'✅' if stats['secret_key_configured'] else '❌'}\n"
+            message += f"📈 Всего запросов: {stats['request_count']}\n"
+            message += f"⚠️ Ошибок: {stats['error_count']}\n"
+            
+            if stats['request_count'] > 0:
+                error_rate = (stats['error_count'] / stats['request_count']) * 100
+                message += f"📉 Процент ошибок: {error_rate:.1f}%\n"
+            
+            await event.message.answer(message)
+            
+    except Exception as e:
+        logger.error(f"Error in dadata_stats command: {e}")
+        await event.message.answer("❌ Ошибка при получении статистики DaData.")
+        
 # ============= Запуск =============
 
 async def main():

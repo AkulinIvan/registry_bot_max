@@ -23,6 +23,16 @@ class BotConfig:
     event_name: str = field(default_factory=lambda: os.getenv('EVENT_NAME', 'Дни предпринимательства'))
     log_level: str = field(default_factory=lambda: os.getenv('LOG_LEVEL', 'INFO'))
     environment: str = field(default_factory=lambda: os.getenv('ENVIRONMENT', 'development'))
+    admin_ids: list = field(default_factory=lambda: [
+        int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()
+    ])
+
+
+@dataclass(frozen=True)
+class DadataConfig:
+    """Конфигурация DaData API"""
+    api_key: str = field(default_factory=lambda: os.getenv('DADATA_API_KEY', ''))
+    secret_key: str = field(default_factory=lambda: os.getenv('DADATA_SECRET_KEY', ''))
 
 
 @dataclass(frozen=True)
@@ -30,3 +40,4 @@ class AppConfig:
     """Основная конфигурация приложения"""
     bot: BotConfig = field(default_factory=BotConfig)
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
+    dadata: DadataConfig = field(default_factory=DadataConfig)

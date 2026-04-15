@@ -1,3 +1,4 @@
 maxapi
 python-dotenv
 aiomysql
+httpx

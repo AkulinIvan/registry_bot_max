@@ -479,6 +479,66 @@ class Database:
                 return reg_id
     
     @db_error_handler
+    async def save_company_data(self, user_id: int, company_data: Dict[str, Any]) -> None:
+        """Сохранение данных компании из DaData"""
+        logger.debug(f"Saving company data for user {user_id}")
+        
+        # Создаем таблицу для данных компаний если её нет
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                self.query_count += 1
+                
+                # Таблица для хранения данных компаний
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS company_data (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        inn VARCHAR(12) NOT NULL,
+                        name_full VARCHAR(500),
+                        name_short VARCHAR(255),
+                        ogrn VARCHAR(15),
+                        kpp VARCHAR(9),
+                        opf VARCHAR(100),
+                        address VARCHAR(500),
+                        status VARCHAR(50),
+                        type VARCHAR(20),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_user_id (user_id),
+                        INDEX idx_inn (inn)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    COMMENT='Company data from DaData'
+                """)
+                
+                # Сохраняем данные
+                await cur.execute("""
+                    INSERT INTO company_data 
+                    (user_id, inn, name_full, name_short, ogrn, kpp, opf, address, status, type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    name_full = VALUES(name_full),
+                    name_short = VALUES(name_short),
+                    ogrn = VALUES(ogrn),
+                    kpp = VALUES(kpp),
+                    opf = VALUES(opf),
+                    address = VALUES(address),
+                    status = VALUES(status),
+                    type = VALUES(type)
+                """, (
+                    user_id,
+                    company_data.get('inn', ''),
+                    company_data.get('name', {}).get('full', '')[:500],
+                    company_data.get('name', {}).get('short', '')[:255],
+                    company_data.get('ogrn', ''),
+                    company_data.get('kpp', ''),
+                    company_data.get('opf', {}).get('full', '')[:100],
+                    company_data.get('address', {}).get('value', '')[:500],
+                    company_data.get('state', {}).get('status', ''),
+                    company_data.get('type', '')
+                ))
+                
+                logger.info(f"✅ Company data saved for user {user_id}")
+                
+    @db_error_handler
     async def check_inn_exists(self, inn: str) -> bool:
         """Проверка существования ИНН"""
         logger.debug(f"Checking if INN exists: {inn[:4]}****")
