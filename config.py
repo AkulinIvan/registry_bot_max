@@ -66,6 +66,12 @@ class LoggingConfig:
     console_log_level: str = field(default_factory=lambda: os.getenv('CONSOLE_LOG_LEVEL', 'INFO'))
     file_log_level: str = field(default_factory=lambda: os.getenv('FILE_LOG_LEVEL', 'DEBUG'))
 
+@dataclass(frozen=True)
+class BitrixConfig:
+    """Конфигурация Bitrix24 API"""
+    register_url: str = field(default_factory=lambda: os.getenv('BITRIX_REGISTER_URL', 'https://bitrix.neto.ru/.bot_dp_register.php'))
+    list_url: str = field(default_factory=lambda: os.getenv('BITRIX_LIST_URL', 'https://bitrix.neto.ru/.bot_dp_register_list.php'))
+    timeout: float = field(default_factory=lambda: float(os.getenv('BITRIX_TIMEOUT', '10.0')))
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -74,6 +80,7 @@ class AppConfig:
     db: DatabaseConfig = field(default_factory=DatabaseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dadata: DadataConfig = field(default_factory=DadataConfig)
+    bitrix: BitrixConfig = field(default_factory=BitrixConfig)
 
     def __post_init__(self):
         """Валидация конфигурации после инициализации"""

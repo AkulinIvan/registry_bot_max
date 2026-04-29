@@ -10,7 +10,7 @@ from functools import wraps
 from logging.handlers import RotatingFileHandler
 import os
 
-from maxapi import Bot, Dispatcher, F
+from maxapi import Bot, Dispatcher
 from maxapi.types import MessageCreated, Command
 from maxapi.types.updates import BotAdded, BotStarted, DialogRemoved, MessageCallback
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
@@ -20,6 +20,7 @@ from maxapi.exceptions.max import MaxApiError
 from config import AppConfig
 from dadata_client import DadataClient
 from database import Database
+from bitrix_client import BitrixClient
 
 # Настройка логирования
 config = AppConfig()
@@ -94,6 +95,12 @@ logger.info("=" * 60)
 bot = Bot(token=config.bot.token)
 dp = Dispatcher()
 db = Database()
+
+bitrix_client = BitrixClient(
+    register_url=config.bitrix.register_url,
+    list_url=config.bitrix.list_url,
+    timeout=config.bitrix.timeout
+)
 
 # Хранилище состояний
 user_states = {}
@@ -543,8 +550,8 @@ async def handle_callback(event: MessageCallback):
             logger.error(f"Failed to save user: {e}")
         
         await event.message.answer(
-            "📋 <b>Регистрация на форум</b>\n\n"
-            "Шаг 1/3: Поделитесь вашим номером телефона.\n\n"
+            "📋 Регистрация на форум\n\n"
+            "Поделитесь вашим номером телефона.\n\n"
             "📱 Нажмите кнопку ниже или отправьте номер текстом:\n"
             "+7 999 123-45-67",
             attachments=[keyboard]
@@ -552,7 +559,7 @@ async def handle_callback(event: MessageCallback):
     
     elif callback_data == "menu_announcements":
         await event.message.answer(
-            "📢 <b>Анонсы мероприятий</b>\n\n"
+            "📢 Анонсы мероприятий\n\n"
             "Ближайшие мероприятия:\n"
             "• 15 июня - Мастер-класс по маркетингу\n"
             "• 22 июня - Нетворкинг-встреча\n"
@@ -799,7 +806,7 @@ async def handle_all_messages(event: MessageCreated):
             await db.save_user(
                 user_id=user_id,
                 email=email,
-                state='awaiting_inn',
+                state='awaiting_name',
                 status='pending'
             )
             logger.info(f"Email saved for user {user_id}")
@@ -808,16 +815,72 @@ async def handle_all_messages(event: MessageCreated):
             await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
             return
 
+        user_states[user_id] = 'awaiting_name'
+        logger.info(f"User {user_id} state changed to 'awaiting_name'")
+
+        await event.message.answer(
+            "👤 Отлично! Теперь введите ваше ФИО:\n"
+            "Например: Иванов Иван Иванович"
+        )
+        return
+
+    # Обработка состояния ожидания ФИО
+    elif state == 'awaiting_name':
+        logger.info(f"Processing name input for user {user_id}")
+        
+        if not text:
+            logger.warning(f"No text provided for name by user {user_id}")
+            await event.message.answer(
+                "👤 Пожалуйста, введите ваше ФИО текстом:\n"
+                "Например: Иванов Иван Иванович"
+            )
+            return
+        
+        # Базовая валидация ФИО
+        name_text = text.strip()
+        
+        # Проверяем, что ФИО состоит минимум из 2 слов
+        name_parts = name_text.split()
+        if len(name_parts) < 2:
+            logger.warning(f"Invalid name format for user {user_id}: {name_text}")
+            await event.message.answer(
+                "❌ Пожалуйста, введите фамилию и имя (минимум 2 слова).\n"
+                "Например: Иванов Иван"
+            )
+            return
+        
+        # Проверяем длину
+        if len(name_text) < 5:
+            logger.warning(f"Name too short for user {user_id}: {name_text}")
+            await event.message.answer(
+                "❌ Слишком короткое ФИО. Пожалуйста, введите полное ФИО.\n"
+                "Например: Иванов Иван Иванович"
+            )
+            return
+        
+        try:
+            await db.save_user(
+                user_id=user_id,
+                name=name_text,
+                state='awaiting_inn',
+                status='pending'
+            )
+            logger.info(f"Name saved for user {user_id}: {name_text}")
+        except Exception as e:
+            logger.error(f"Failed to save name for user {user_id}: {e}")
+            await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
+            return
+        
         user_states[user_id] = 'awaiting_inn'
         logger.info(f"User {user_id} state changed to 'awaiting_inn'")
-
+        
         await event.message.answer(
             "📋 Отлично! Теперь отправьте ваш ИНН:\n"
             "• 10 цифр для организации\n"
             "• 12 цифр для ИП"
         )
         return
-
+    
     # Обработка состояния ожидания ИНН
     elif state == 'awaiting_inn':
         logger.info(f"Processing INN input for user {user_id}")
@@ -881,33 +944,68 @@ async def handle_all_messages(event: MessageCreated):
             await event.message.answer(company_info)
         
         try:
-            inn_exists = await db.check_inn_exists(validated_inn)
-            if inn_exists:
-                logger.warning(f"INN already registered for user {user_id}: {validated_inn[:4]}****")
+            # Проверяем дубликат в Bitrix24
+            duplicate_in_bitrix = await bitrix_client.check_duplicate(
+                inn=validated_inn,
+                phone=user.get('phone', '')
+            )
+            
+            if duplicate_in_bitrix:
+                logger.warning(f"Duplicate found in Bitrix24 for user {user_id}")
                 await event.message.answer(
-                    "⚠️ Этот ИНН уже зарегистрирован.\n"
+                    "⚠️ Пользователь с таким ИНН или телефоном уже зарегистрирован в системе.\n"
                     "Если это ошибка, свяжитесь с организаторами."
                 )
                 return
+                
         except Exception as e:
-            logger.error(f"Failed to check INN existence: {e}")
-            await event.message.answer("❌ Ошибка проверки ИНН. Попробуйте позже.")
-            return
+            logger.error(f"Failed to check duplicate in Bitrix24: {e}")
+            
+        company_type, org_name = get_company_type_and_name(validation_result, company_data, user.get('name', user_name))
         
         try:
-            # Сохраняем дополнительные данные компании если доступны
+            # Отправляем данные в Bitrix24 с правильными полями
+            bitrix_id = await bitrix_client.send_registration({
+                'name': user.get('name', user_name),
+                'inn': validated_inn,
+                'phone': user.get('phone', ''),
+                'email': user.get('email', ''),
+                'company_name': org_name,
+                'company_type': company_type,
+                'is_individual': company_type == 'individual',
+            })
+            
+            if bitrix_id:
+                logger.info(f"Bitrix24 registration ID: {bitrix_id}")
+            else:
+                logger.warning("Failed to get valid Bitrix24 ID")
+                
+        except Exception as e:
+            logger.error(f"Error sending to Bitrix24: {e}")
+            bitrix_id = None
+        
+        # Если Bitrix24 не вернул ID, генерируем локальный
+        if not bitrix_id:
+            import hashlib
+            raw = f"{user.get('phone')}_{validated_inn}"
+            local_id = hashlib.md5(raw.encode()).hexdigest()[:8].upper()
+            bitrix_id = f"DP-{local_id}"
+            logger.info(f"Using local ID: {bitrix_id}")
+        
+        try:
+            # Сохраняем регистрацию локально
             reg_id = await db.save_registration(
                 user_id=user_id,
                 chat_id=chat_id,
-                name=user_name,
-                phone=user['phone'],
-                email=user.get('email'),  # Добавляем email
+                name=user.get('name', user_name),
+                phone=user.get('phone', ''),
+                email=user.get('email', ''),
                 inn=validated_inn,
                 event_name=config.bot.event_name
             )
             logger.info(f"Registration saved for user {user_id}, reg_id: {reg_id}")
             
-            # Сохраняем данные компании в отдельную таблицу если нужно
+            # Сохраняем данные компании если доступны
             if not is_fallback and company_data:
                 await db.save_company_data(user_id, company_data)
                 
@@ -918,16 +1016,27 @@ async def handle_all_messages(event: MessageCreated):
         
         if user_id in user_states:
             del user_states[user_id]
-            logger.debug(f"User {user_id} removed from state memory")
         
         success_message = "🎉 Отлично! Вы успешно зарегистрированы на мероприятие!\n\n"
+        
+        if bitrix_id:
+            success_message += f"🆔 Ваш ID регистрации: <b>{bitrix_id}</b>\n"
+            success_message += "📱 Покажите этот номер при входе на мероприятие.\n\n"
+        
         if not is_fallback and company_data:
-            success_message += f"Организация: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
+            success_message += f"🏢 Организация: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
+        
         success_message += "\nМы свяжемся с вами по указанному номеру телефона. До встречи! 👋"
         
         await event.message.answer(success_message)
         
-        logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****")
+        if bitrix_id:
+            await event.message.answer(
+                f"🔢 Ваш ID для входа: <code>{bitrix_id}</code>\n\n"
+                "Сохраните этот номер!"
+            )
+        
+        logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****, ID: {bitrix_id}")
         return
     
     # Fallback
@@ -970,6 +1079,31 @@ async def dadata_stats_command(event: MessageCreated):
     except Exception as e:
         logger.error(f"Error in dadata_stats command: {e}")
         await event.message.answer("❌ Ошибка при получении статистики DaData.")
+
+def get_company_type_and_name(validation_result: dict, company_data: dict, name: str) -> tuple:
+    """
+    Определяет тип компании и название для поля Org
+    
+    Returns:
+        (company_type, org_name)
+    """
+    raw_type = validation_result.get('type', '').upper()
+    is_fallback = validation_result.get('fallback', False)
+    
+    if is_fallback or not company_data:
+        # Fallback: просто ФИО
+        return 'individual', name
+    
+    # DaData возвращает: 'INDIVIDUAL' для ИП, 'LEGAL' для ООО/АО
+    if raw_type == 'INDIVIDUAL':
+        return 'individual', f"ИП {name}"
+    elif raw_type == 'LEGAL':
+        company_name = company_data.get('name', {}).get('short', name)
+        return 'organization', company_name
+    else:
+        # Самозанятый или другой тип
+        return 'unknown', name
+
         
 # ============= Запуск =============
 
