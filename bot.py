@@ -231,12 +231,23 @@ async def validate_inn(inn: str) -> Optional[Dict[str, Any]]:
         }
 
 
-def get_user_id(event: MessageCreated) -> int:
+def get_user_id(event) -> int:
     """Получение user_id из события"""
     try:
-        if event.message.sender:
-            return event.message.sender.user_id
-        logger.warning("No sender in message event")
+        # Для MessageCreated
+        if hasattr(event, 'message') and event.message:
+            if event.message.sender:
+                return event.message.sender.user_id
+        
+        # Для MessageCallback
+        if hasattr(event, 'user') and event.user:
+            return event.user.user_id
+            
+        # Прямой атрибут
+        if hasattr(event, 'user_id'):
+            return event.user_id
+            
+        logger.warning("No sender/user in event")
         return 0
     except Exception as e:
         logger.error(f"Failed to get user_id: {e}")
@@ -486,7 +497,19 @@ async def logs_command(event: MessageCreated):
 @log_function_call
 async def handle_callback(event: MessageCallback):
     """Обработка нажатий на кнопки"""
-    user_id = get_user_id(event)
+    
+    # Получаем user_id из callback.user (правильное место!)
+    user_id = None
+    
+    if hasattr(event, 'callback') and event.callback:
+        if hasattr(event.callback, 'user') and event.callback.user:
+            user_id = event.callback.user.user_id
+    
+    # Запасной вариант
+    if not user_id:
+        user_id = get_user_id(event)
+    
+    logger.info(f"Callback from user {user_id}: {getattr(event.callback, 'payload', None) if hasattr(event, 'callback') and event.callback else 'unknown'}")
     
     # В MessageCallback данные приходят через event.callback.payload
     if not hasattr(event, 'callback') or not event.callback:
@@ -494,7 +517,6 @@ async def handle_callback(event: MessageCallback):
         return
     
     callback_data = getattr(event.callback, 'payload', None)
-    logger.info(f"Callback from user {user_id}: {callback_data}")
     
     if not callback_data:
         return
@@ -517,12 +539,12 @@ async def handle_callback(event: MessageCallback):
                 state='awaiting_phone',
                 status='pending'
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save user: {e}")
         
         await event.message.answer(
             "📋 <b>Регистрация на форум</b>\n\n"
-            "Шаг 1/2: Поделитесь вашим номером телефона.\n\n"
+            "Шаг 1/3: Поделитесь вашим номером телефона.\n\n"
             "📱 Нажмите кнопку ниже или отправьте номер текстом:\n"
             "+7 999 123-45-67",
             attachments=[keyboard]
@@ -707,7 +729,7 @@ async def handle_all_messages(event: MessageCreated):
     # Обработка состояния ожидания телефона
     if state == 'awaiting_phone':
         logger.info(f"Processing phone input for user {user_id}")
-        
+
         # Если есть контакт - используем его
         if phone:
             validated = validate_phone(phone)
@@ -715,7 +737,7 @@ async def handle_all_messages(event: MessageCreated):
             validated = validate_phone(text)
         else:
             validated = None
-        
+
         if not validated:
             logger.warning(f"Invalid phone format for user {user_id}")
             keyboard = create_phone_keyboard()
@@ -725,12 +747,12 @@ async def handle_all_messages(event: MessageCreated):
                 attachments=[keyboard]
             )
             return
-        
+
         try:
             await db.save_user(
                 user_id=user_id,
                 phone=validated.number,
-                state='awaiting_inn',
+                state='awaiting_email',
                 status='pending'
             )
             logger.info(f"Phone saved for user {user_id}")
@@ -738,19 +760,64 @@ async def handle_all_messages(event: MessageCreated):
             logger.error(f"Failed to save phone for user {user_id}: {e}")
             await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
             return
-        
+
+        user_states[user_id] = 'awaiting_email'
+        logger.info(f"User {user_id} state changed to 'awaiting_email'")
+
+        await event.message.answer(
+            "📧 Отлично! Теперь отправьте ваш Email адрес:\n"
+            "Например: example@mail.ru"
+        )
+        return
+    
+    # Обработка состояния ожидания Email
+    elif state == 'awaiting_email':
+        logger.info(f"Processing email input for user {user_id}")
+
+        if not text:
+            logger.warning(f"No text provided for email by user {user_id}")
+            await event.message.answer(
+                "📧 Пожалуйста, отправьте Email адрес текстом:\n"
+                "Например: example@mail.ru"
+            )
+            return
+
+        # Базовая валидация email
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, text.strip()):
+            logger.warning(f"Invalid email format for user {user_id}: {text}")
+            await event.message.answer(
+                "❌ Неверный формат Email.\n"
+                "Пожалуйста, отправьте корректный Email адрес:\n"
+                "Например: example@mail.ru"
+            )
+            return
+
+        email = text.strip().lower()
+
+        try:
+            await db.save_user(
+                user_id=user_id,
+                email=email,
+                state='awaiting_inn',
+                status='pending'
+            )
+            logger.info(f"Email saved for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to save email for user {user_id}: {e}")
+            await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
+            return
+
         user_states[user_id] = 'awaiting_inn'
         logger.info(f"User {user_id} state changed to 'awaiting_inn'")
-        
-        await event.message.answer("🔄 Регистрируем вас...")
-        
+
         await event.message.answer(
             "📋 Отлично! Теперь отправьте ваш ИНН:\n"
             "• 10 цифр для организации\n"
             "• 12 цифр для ИП"
         )
         return
-    
+
     # Обработка состояния ожидания ИНН
     elif state == 'awaiting_inn':
         logger.info(f"Processing INN input for user {user_id}")
@@ -834,6 +901,7 @@ async def handle_all_messages(event: MessageCreated):
                 chat_id=chat_id,
                 name=user_name,
                 phone=user['phone'],
+                email=user.get('email'),  # Добавляем email
                 inn=validated_inn,
                 event_name=config.bot.event_name
             )

@@ -247,6 +247,7 @@ class Database:
                         chat_id BIGINT COMMENT 'Telegram chat ID',
                         name VARCHAR(255) COMMENT 'User full name',
                         phone VARCHAR(20) COMMENT 'Phone number',
+                        email VARCHAR(255) COMMENT 'Email address',
                         inn VARCHAR(12) COMMENT 'INN number',
                         state VARCHAR(50) DEFAULT 'awaiting_phone' COMMENT 'Current state',
                         registration_status VARCHAR(50) DEFAULT 'pending' COMMENT 'Registration status',
@@ -255,7 +256,8 @@ class Database:
                         registered_at TIMESTAMP NULL COMMENT 'Registration completion time',
                         INDEX idx_user_id (user_id),
                         INDEX idx_state (state),
-                        INDEX idx_registration_status (registration_status)
+                        INDEX idx_registration_status (registration_status),
+                        INDEX idx_email (email)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     COMMENT='Bot users table'
                 """)
@@ -270,6 +272,7 @@ class Database:
                         chat_id BIGINT COMMENT 'Telegram chat ID',
                         name VARCHAR(255) NOT NULL COMMENT 'User name',
                         phone VARCHAR(20) NOT NULL COMMENT 'Phone number',
+                        email VARCHAR(255) COMMENT 'Email address',
                         inn VARCHAR(12) NOT NULL COMMENT 'INN number',
                         event_name VARCHAR(255) NOT NULL COMMENT 'Event name',
                         registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Registration date',
@@ -278,7 +281,8 @@ class Database:
                         INDEX idx_inn (inn),
                         INDEX idx_registration_date (registration_date),
                         INDEX idx_status (status),
-                        INDEX idx_event_name (event_name)
+                        INDEX idx_event_name (event_name),
+                        INDEX idx_email (email)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                     COMMENT='Event registrations table'
                 """)
@@ -340,37 +344,31 @@ class Database:
         chat_id: int = None,
         name: str = None,
         phone: str = None,
+        email: str = None,
         inn: str = None,
         state: str = None,
         status: str = None
     ) -> int:
         """Сохранение или обновление пользователя"""
         logger.debug(f"Saving user {user_id} to database")
-        logger.debug(f"  chat_id: {chat_id}")
-        logger.debug(f"  name: {name}")
-        logger.debug(f"  phone: {phone[:4] if phone else None}****" if phone else "  phone: None")
-        logger.debug(f"  inn: {inn[:4] if inn else None}****" if inn else "  inn: None")
-        logger.debug(f"  state: {state}")
-        logger.debug(f"  status: {status}")
-        
+        logger.debug(f"  email: {email}" if email else "  email: None")
+
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
                 self.query_count += 1
-                
+
                 # Проверяем существование пользователя
                 await cur.execute(
                     "SELECT id FROM users WHERE user_id = %s",
                     (user_id,)
                 )
                 existing = await cur.fetchone()
-                
+
                 if existing:
-                    logger.debug(f"User {user_id} already exists (id: {existing[0]}), updating...")
-                    
                     # Обновляем существующего
                     updates = []
                     params = []
-                    
+
                     if chat_id is not None:
                         updates.append("chat_id = %s")
                         params.append(chat_id)
@@ -380,6 +378,9 @@ class Database:
                     if phone is not None:
                         updates.append("phone = %s")
                         params.append(phone)
+                    if email is not None:  # Добавляем email
+                        updates.append("email = %s")
+                        params.append(email)
                     if inn is not None:
                         updates.append("inn = %s")
                         params.append(inn)
@@ -389,29 +390,24 @@ class Database:
                     if status is not None:
                         updates.append("registration_status = %s")
                         params.append(status)
-                    
+
                     if updates:
                         params.append(user_id)
                         update_query = f"UPDATE users SET {', '.join(updates)} WHERE user_id = %s"
-                        logger.debug(f"Update query: {update_query}")
                         await cur.execute(update_query, params)
                         logger.info(f"✅ User {user_id} updated successfully")
-                    else:
-                        logger.debug(f"No fields to update for user {user_id}")
-                    
+
                     return existing[0]
                 else:
-                    logger.debug(f"User {user_id} does not exist, creating new record...")
-                    
                     # Создаем нового
                     await cur.execute("""
-                        INSERT INTO users (user_id, chat_id, name, phone, inn, state, registration_status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """, (user_id, chat_id, name, phone, inn, state, status or 'pending'))
-                    
+                        INSERT INTO users (user_id, chat_id, name, phone, email, inn, state, registration_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (user_id, chat_id, name, phone, email, inn, state, status or 'pending'))
+
                     new_id = cur.lastrowid
                     logger.info(f"✅ New user created: user_id={user_id}, id={new_id}")
-                    
+
                     return new_id
     
     @db_error_handler
@@ -421,61 +417,51 @@ class Database:
         chat_id: int,
         name: str,
         phone: str,
+        email: str,
         inn: str,
         event_name: str
     ) -> int:
         """Сохранение регистрации"""
         logger.info(f"Saving registration for user {user_id}")
-        logger.debug(f"  chat_id: {chat_id}")
-        logger.debug(f"  name: {name}")
-        logger.debug(f"  phone: {phone[:4]}****" if phone else "  phone: None")
-        logger.debug(f"  inn: {inn[:4]}****" if inn else "  inn: None")
-        logger.debug(f"  event_name: {event_name}")
-        
+        logger.debug(f"  email: {email}" if email else "  email: None")
+
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
                 self.query_count += 1
-                
+
                 # Проверяем, не зарегистрирован ли уже пользователь
                 await cur.execute(
                     "SELECT id FROM registrations WHERE user_id = %s AND event_name = %s",
                     (user_id, event_name)
                 )
                 existing = await cur.fetchone()
-                
+
                 if existing:
-                    logger.warning(f"User {user_id} already registered for event '{event_name}' (reg_id: {existing[0]})")
+                    logger.warning(f"User {user_id} already registered for event '{event_name}'")
                     return existing[0]
-                
+
                 # Сохраняем регистрацию
                 await cur.execute("""
-                    INSERT INTO registrations (user_id, chat_id, name, phone, inn, event_name)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (user_id, chat_id, name, phone, inn, event_name))
-                
+                    INSERT INTO registrations (user_id, chat_id, name, phone, email, inn, event_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (user_id, chat_id, name, phone, email, inn, event_name))
+
                 reg_id = cur.lastrowid
                 logger.info(f"✅ Registration record created: id={reg_id}")
-                
+
                 # Обновляем статус пользователя
                 await cur.execute("""
                     UPDATE users 
                     SET registration_status = 'completed',
                         registered_at = NOW(),
                         state = 'registered',
-                        inn = %s
+                        inn = %s,
+                        email = %s
                     WHERE user_id = %s
-                """, (inn, user_id))
-                
+                """, (inn, email, user_id))
+
                 logger.info(f"✅ User {user_id} status updated to 'completed'")
-                
-                # Проверяем, что обновление прошло успешно
-                await cur.execute(
-                    "SELECT registration_status, registered_at FROM users WHERE user_id = %s",
-                    (user_id,)
-                )
-                updated = await cur.fetchone()
-                logger.debug(f"User {user_id} status after update: {updated[0]}, registered_at: {updated[1]}")
-                
+
                 return reg_id
     
     @db_error_handler
