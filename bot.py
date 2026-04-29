@@ -11,10 +11,10 @@ from logging.handlers import RotatingFileHandler
 import os
 
 from maxapi import Bot, Dispatcher, F
-from maxapi.types import MessageCreated, Command, MessageCallback
-from maxapi.types.updates import BotAdded, BotStarted, DialogRemoved
+from maxapi.types import MessageCreated, Command
+from maxapi.types.updates import BotAdded, BotStarted, DialogRemoved, MessageCallback
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
-from maxapi.types.attachments.buttons import RequestContactButton
+from maxapi.types.attachments.buttons import RequestContactButton, CallbackButton
 from maxapi.exceptions.max import MaxApiError
 
 from config import AppConfig
@@ -356,7 +356,21 @@ def create_phone_keyboard():
         logger.error(f"Failed to create phone keyboard: {e}")
         return None
 
+def create_main_menu_keyboard():
+    """Главное меню с 3 кнопками"""
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="📋 Регистрация на форум", callback_data="menu_registration", payload="menu_registration"))
+    builder.row(CallbackButton(text="📢 Анонсы мероприятий", callback_data="menu_announcements", payload="menu_announcements"))
+    builder.row(CallbackButton(text="🤝 Хочу коллаборацию", callback_data="menu_collaboration", payload="menu_collaboration"))
+    return builder.as_markup()
 
+
+def get_back_keyboard():
+    """Клавиатура с кнопкой Назад"""
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
+    return builder.as_markup()
+    
 # Функция для очистки старых логов (можно вызывать периодически)
 def cleanup_old_logs():
     """Очистка старых лог-файлов"""
@@ -404,38 +418,17 @@ async def start_command(event: MessageCreated):
     
     logger.info(f"Start command - user_id: {user_id}, name: {user_name}, chat_id: {chat_id}")
     
-    try:
-        await db.save_user(
-            user_id=user_id,
-            chat_id=chat_id,
-            name=user_name,
-            state='awaiting_phone',
-            status='pending'
-        )
-        logger.info(f"User {user_id} saved to database with state 'awaiting_phone'")
-    except Exception as e:
-        logger.error(f"Failed to save user {user_id}: {e}")
-        await event.message.answer("❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
-        return
+    if user_id in user_states:
+        del user_states[user_id]
+        
+    keyboard = create_main_menu_keyboard()
     
-    user_states[user_id] = 'awaiting_phone'
-    
-    keyboard = create_phone_keyboard()
-    if not keyboard:
-        await event.message.answer("❌ Ошибка создания клавиатуры. Используйте /start позже.")
-        return
-    
-    try:
-        await event.message.answer(
-            "👋 Добро пожаловать!\n\n"
-            "Вы можете зарегистрироваться на наше мероприятие прямо здесь.\n\n"
-            "Нажмите кнопку ниже, чтобы поделиться своим номером телефона "
-            "и подтвердить участие. Это займёт всего несколько секунд!",
-            attachments=[keyboard]
-        )
-        logger.info(f"Welcome message sent to user {user_id}")
-    except Exception as e:
-        logger.error(f"Failed to send welcome message to user {user_id}: {e}")
+    await event.message.answer(
+        "👋 Добро пожаловать на форум «Дни предпринимательства»!\n\n"
+        "Выберите интересующий вас раздел:",
+        attachments=[keyboard]
+    )
+    logger.info(f"Menu sent to user {user_id}")
 
 
 @dp.message_created(Command('logs'))
@@ -486,6 +479,85 @@ async def logs_command(event: MessageCreated):
         logger.error(f"Error in logs command: {e}")
         await event.message.answer("❌ Ошибка при получении статистики логов.")
 
+# ============= CALLBACK ОБРАБОТЧИК =============
+
+@dp.message_callback()
+@safe_execute
+@log_function_call
+async def handle_callback(event: MessageCallback):
+    """Обработка нажатий на кнопки"""
+    user_id = get_user_id(event)
+    
+    # В MessageCallback данные приходят через event.callback.payload
+    if not hasattr(event, 'callback') or not event.callback:
+        logger.warning("No callback in event")
+        return
+    
+    callback_data = getattr(event.callback, 'payload', None)
+    logger.info(f"Callback from user {user_id}: {callback_data}")
+    
+    if not callback_data:
+        return
+    
+    # Отвечаем на callback
+    try:
+        await event.answer()
+    except:
+        pass
+    
+    if callback_data == "menu_registration":
+        # Начинаем регистрацию
+        user_states[user_id] = 'awaiting_phone'
+        keyboard = create_phone_keyboard()
+        try:
+            await db.save_user(
+                user_id=user_id,
+                chat_id=get_chat_id(event),
+                name=get_user_name(event),
+                state='awaiting_phone',
+                status='pending'
+            )
+        except:
+            pass
+        
+        await event.message.answer(
+            "📋 <b>Регистрация на форум</b>\n\n"
+            "Шаг 1/2: Поделитесь вашим номером телефона.\n\n"
+            "📱 Нажмите кнопку ниже или отправьте номер текстом:\n"
+            "+7 999 123-45-67",
+            attachments=[keyboard]
+        )
+    
+    elif callback_data == "menu_announcements":
+        await event.message.answer(
+            "📢 <b>Анонсы мероприятий</b>\n\n"
+            "Ближайшие мероприятия:\n"
+            "• 15 июня - Мастер-класс по маркетингу\n"
+            "• 22 июня - Нетворкинг-встреча\n"
+            "• 1 июля - Бизнес-завтрак с экспертами\n\n"
+            "Следите за обновлениями!",
+            attachments=[get_back_keyboard()]
+        )
+    
+    elif callback_data == "menu_collaboration":
+        await event.message.answer(
+            "🤝 <b>Хочу коллаборацию</b>\n\n"
+            "Для поиска партнеров и коллабораций:\n\n"
+            "📧 Email: collaboration@example.com\n"
+            "📱 Telegram: @collab_manager\n\n"
+            "Или заполните форму на сайте.",
+            attachments=[get_back_keyboard()]
+        )
+    
+    elif callback_data == "back_to_menu":
+        if user_id in user_states:
+            del user_states[user_id]
+        await event.message.answer(
+            "👋 Главное меню:\n\nВыберите интересующий вас раздел:",
+            attachments=[create_main_menu_keyboard()]
+        )
+    
+    
 
 # ============= Обработчики обновлений =============
 
@@ -496,46 +568,35 @@ async def bot_started_handler(event: BotStarted):
     """Бот запущен пользователем"""
     logger.info(f"Bot started - user_id: {event.user.user_id}, chat_id: {event.chat_id}")
     
-    keyboard = create_phone_keyboard()
-    if not keyboard:
-        logger.error("Failed to create keyboard for bot_started")
-        return
+    keyboard = create_main_menu_keyboard()
     
-    # Пробуем отправить в чат
     try:
         await bot.send_message(
             chat_id=event.chat_id,
             text=(
-                "👋 Добро пожаловать!\n\n"
-                "Вы можете зарегистрироваться на наше мероприятие прямо здесь.\n\n"
-                "Нажмите кнопку ниже, чтобы поделиться своим номером телефона "
-                "и подтвердить участие. Это займёт всего несколько секунд!"
+                "👋 Добро пожаловать на форум «Дни предпринимательства»!\n\n"
+                "Выберите интересующий вас раздел:"
             ),
             attachments=[keyboard]
         )
-        logger.info(f"Bot started message sent to chat {event.chat_id}")
+        logger.info(f"Menu sent to chat {event.chat_id}")
     except MaxApiError as e:
         if "chat.not.found" in str(e):
-            logger.warning(f"Chat {event.chat_id} not found, sending to user {event.user.user_id}")
-            # Если чат не найден, отправляем пользователю
             try:
                 await bot.send_message(
                     user_id=event.user.user_id,
                     text=(
-                        "👋 Добро пожаловать!\n\n"
-                        "Вы можете зарегистрироваться на наше мероприятие прямо здесь.\n\n"
-                        "Нажмите кнопку ниже, чтобы поделиться своим номером телефона "
-                        "и подтвердить участие. Это займёт всего несколько секунд!"
+                        "👋 Добро пожаловать на форум «Дни предпринимательства»!\n\n"
+                        "Выберите интересующий вас раздел:"
                     ),
                     attachments=[keyboard]
                 )
-                logger.info(f"Bot started message sent to user {event.user.user_id}")
-            except Exception as e2:
-                logger.error(f"Failed to send bot_started message to user {event.user.user_id}: {e2}")
+            except:
+                pass
         else:
-            raise
+            logger.error(f"Error in bot_started: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in bot_started_handler: {e}")
+        logger.error(f"Unexpected error in bot_started: {e}")
 
 
 @dp.bot_added()
@@ -545,25 +606,21 @@ async def bot_added_handler(event: BotAdded):
     """Бот добавлен в чат"""
     logger.info(f"Bot added to chat {event.chat_id}")
     
-    keyboard = create_phone_keyboard()
-    if not keyboard:
-        logger.error("Failed to create keyboard for bot_added")
-        return
+    keyboard = create_main_menu_keyboard()
     
     try:
         await bot.send_message(
             chat_id=event.chat_id,
             text=(
                 "👋 Добро пожаловать!\n\n"
-                "Я бот для регистрации на мероприятие.\n"
-                "Нажмите кнопку ниже, чтобы поделиться номером телефона "
-                "и подтвердить участие. Это займёт всего несколько секунд!"
+                "Я бот для регистрации на мероприятия.\n"
+                "Выберите интересующий вас раздел:"
             ),
             attachments=[keyboard]
         )
-        logger.info(f"Bot added message sent to chat {event.chat_id}")
+        logger.info(f"Menu sent to chat {event.chat_id}")
     except Exception as e:
-        logger.error(f"Failed to send bot_added message to chat {event.chat_id}: {e}")
+        logger.error(f"Failed to send bot_added message: {e}")
 
 
 # ============= Основной обработчик сообщений =============
