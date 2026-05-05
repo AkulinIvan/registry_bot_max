@@ -21,6 +21,7 @@ from config import AppConfig
 from dadata_client import DadataClient
 from database import Database
 from bitrix_client import BitrixClient
+from admin_service import AdminService, format_broadcast_result
 
 # Настройка логирования
 config = AppConfig()
@@ -95,12 +96,12 @@ logger.info("=" * 60)
 bot = Bot(token=config.bot.token)
 dp = Dispatcher()
 db = Database()
-
 bitrix_client = BitrixClient(
     register_url=config.bitrix.register_url,
     list_url=config.bitrix.list_url,
     timeout=config.bitrix.timeout
 )
+admin_service = AdminService(bot=bot, db=db, config=config)
 
 # Хранилище состояний
 user_states = {}
@@ -448,7 +449,136 @@ async def start_command(event: MessageCreated):
     )
     logger.info(f"Menu sent to user {user_id}")
 
+@dp.message_created(Command('admin'))
+@safe_execute
+async def admin_command(event: MessageCreated):
+    """Команда администратора - показывает меню"""
+    user_id = get_user_id(event)
+    
+    if not admin_service.is_admin(user_id):
+        logger.warning(f"Unauthorized admin access from user {user_id}")
+        await event.message.answer("⛔ У вас нет доступа к панели администратора.")
+        return
+    
+    # Создаем клавиатуру администратора
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="📊 Статистика", callback_data="admin_stats", payload="admin_stats"))
+    builder.row(CallbackButton(text="📨 Рассылка", callback_data="admin_broadcast", payload="admin_broadcast"))
+    builder.row(CallbackButton(text="📈 История рассылок", callback_data="admin_history", payload="admin_history"))
+    builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
+    
+    await event.message.answer(
+        "🔧 <b>Панель администратора</b>\n\n"
+        "Выберите действие:",
+        attachments=[builder.as_markup()]
+    )
 
+
+@dp.message_created(Command('stats'))
+@safe_execute
+async def stats_command(event: MessageCreated):
+    """Показать статистику бота"""
+    user_id = get_user_id(event)
+    
+    if not admin_service.is_admin(user_id):
+        logger.warning(f"Unauthorized stats access from user {user_id}")
+        await event.message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+    
+    try:
+        # Получаем статистику из БД
+        db_stats = await db.get_stats()
+        user_counts = await admin_service.get_user_count()
+        
+        message = "📊 Статистика бота\n\n"
+        message += "Пользователи:\n"
+        message += f"👥 Всего: {user_counts['total']}\n"
+        message += f"✅ Зарегистрировано: {user_counts['completed']}\n"
+        message += f"⏳ В процессе: {user_counts['pending']}\n"
+        message += f"🚫 Заблокировали: {user_counts['blocked']}\n"
+        message += f"📱 Активные: {user_counts['active']}\n\n"
+        
+        message += "Регистрации:\n"
+        message += f"📋 Всего: {db_stats['total_registrations']}\n"
+        message += f"✅ Завершено: {db_stats['completed']}\n"
+        message += f"📈 Процент завершения: {db_stats['completion_rate']}\n\n"
+        
+        message += "База данных:\n"
+        message += f"🔍 Запросов: {db_stats['db_queries']}\n"
+        message += f"❌ Ошибок: {db_stats['db_errors']}\n"
+        
+        await event.message.answer(message)
+        
+    except Exception as e:
+        logger.error(f"Error in stats command: {e}")
+        await event.message.answer("❌ Ошибка при получении статистики.")
+
+
+@dp.message_created(Command('broadcast'))
+@safe_execute
+async def broadcast_command(event: MessageCreated):
+    """Начать рассылку сообщений"""
+    user_id = get_user_id(event)
+    
+    if not admin_service.is_admin(user_id):
+        logger.warning(f"Unauthorized broadcast access from user {user_id}")
+        await event.message.answer("⛔ У вас нет доступа к рассылке.")
+        return
+    
+    # Устанавливаем состояние ожидания сообщения для рассылки
+    user_states[user_id] = 'awaiting_broadcast'
+    
+    # Обновляем состояние в БД
+    try:
+        await db.save_user(
+            user_id=user_id,
+            state='awaiting_broadcast'
+        )
+    except Exception as e:
+        logger.error(f"Failed to update state in DB: {e}")
+    
+    # Создаем клавиатуру с кнопкой отмены
+    builder = InlineKeyboardBuilder()
+    builder.row(CallbackButton(text="❌ Отмена", callback_data="cancel_broadcast", payload="cancel_broadcast"))
+    
+    await event.message.answer(
+        "📨 Создание рассылки\n\n"
+        "Отправьте текст сообщения, которое хотите разослать всем пользователям.\n\n"
+        "Поддерживается HTML-форматирование:\n"
+        "• &lt;b&gt;жирный&lt;/b&gt;\n"
+        "• &lt;i&gt;курсив&lt;/i&gt;\n"
+        "• &lt;code&gt;моноширинный&lt;/code&gt;\n\n"
+        "Для отмены нажмите кнопку ниже или отправьте /cancel",
+        attachments=[builder.as_markup()]
+    )
+
+@dp.message_created(Command('cancel'))
+@safe_execute
+async def cancel_command(event: MessageCreated):
+    """Отмена текущего действия"""
+    user_id = get_user_id(event)
+    
+    if user_id in user_states:
+        state = user_states[user_id]
+        
+        if state == 'awaiting_broadcast':
+            del user_states[user_id]
+            await event.message.answer("❌ Рассылка отменена.")
+            return
+        
+        if state == 'awaiting_broadcast_confirm':
+            del user_states[user_id]
+            await event.message.answer("❌ Рассылка отменена.")
+            return
+    
+    # Обычная отмена регистрации
+    if user_id in user_states:
+        del user_states[user_id]
+        await event.message.answer(
+            "↩️ Действие отменено. Возврат в главное меню:",
+            attachments=[create_main_menu_keyboard()]
+        )
+        
 @dp.message_created(Command('logs'))
 @safe_execute
 async def logs_command(event: MessageCreated):
@@ -505,7 +635,7 @@ async def logs_command(event: MessageCreated):
 async def handle_callback(event: MessageCallback):
     """Обработка нажатий на кнопки"""
     
-    # Получаем user_id из callback.user (правильное место!)
+    # Получаем user_id из callback.user
     user_id = None
     
     if hasattr(event, 'callback') and event.callback:
@@ -570,7 +700,7 @@ async def handle_callback(event: MessageCallback):
     
     elif callback_data == "menu_collaboration":
         await event.message.answer(
-            "🤝 <b>Хочу коллаборацию</b>\n\n"
+            "🤝 Хочу коллаборацию\n\n"
             "Для поиска партнеров и коллабораций:\n\n"
             "📧 Email: collaboration@example.com\n"
             "📱 Telegram: @collab_manager\n\n"
@@ -586,7 +716,154 @@ async def handle_callback(event: MessageCallback):
             attachments=[create_main_menu_keyboard()]
         )
     
+    elif callback_data == "admin_stats":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+        
+        db_stats = await db.get_stats()
+        user_counts = await admin_service.get_user_count()
+        
+        message = "📊 <b>Статистика бота</b>\n\n"
+        message += "Пользователи:\n"
+        message += f"👥 Всего: {user_counts['total']}\n"
+        message += f"✅ Зарегистрировано: {user_counts['completed']}\n"
+        message += f"⏳ В процессе: {user_counts['pending']}\n"
+        message += f"🚫 Заблокировали: {user_counts['blocked']}\n\n"
+        
+        message += "Регистрации:\n"
+        message += f"📋 Всего: {db_stats['total_registrations']}\n"
+        message += f"📈 Процент завершения: {db_stats['completion_rate']}\n"
+        
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="◀️ Назад", callback_data="admin_back", payload="admin_back"))
+        
+        await event.message.answer(message, attachments=[builder.as_markup()])
     
+    elif callback_data == "admin_broadcast":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+
+        # Обновляем состояние и в user_states, и в БД
+        user_states[user_id] = 'awaiting_broadcast'
+
+        # Обновляем состояние в БД
+        try:
+            await db.save_user(
+                user_id=user_id,
+                state='awaiting_broadcast'
+            )
+        except Exception as e:
+            logger.error(f"Failed to update state in DB: {e}")
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="❌ Отмена", callback_data="cancel_broadcast", payload="cancel_broadcast"))
+
+        await event.message.answer(
+            "📨 Создание рассылки\n\n"
+            "Отправьте текст сообщения для рассылки всем пользователям.\n\n"
+            "Поддерживается HTML-форматирование",
+            attachments=[builder.as_markup()]
+        )
+    
+    elif callback_data == "admin_history":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+        
+        history = await admin_service.get_broadcast_stats(limit=5)
+        
+        if not history:
+            await event.message.answer("📈 История рассылок пуста.")
+            return
+        
+        message = "📈 Последние рассылки:\n\n"
+        for h in history:
+            success_rate = (h['successful'] / h['total_users'] * 100) if h['total_users'] > 0 else 0
+            message += (
+                f"📨 {h['broadcast_id']}\n"
+                f"   👥 {h['total_users']} | ✅ {h['successful']} | ❌ {h['failed']} | 🚫 {h['blocked']}\n"
+                f"   📈 {success_rate:.1f}% | 📅 {h['created_at'][:10] if h['created_at'] else 'N/A'}\n\n"
+            )
+        
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="◀️ Назад", callback_data="admin_back", payload="admin_back"))
+        
+        await event.message.answer(message, attachments=[builder.as_markup()])
+    
+    elif callback_data == "admin_back":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+        
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="📊 Статистика", callback_data="admin_stats", payload="admin_stats"))
+        builder.row(CallbackButton(text="📨 Рассылка", callback_data="admin_broadcast", payload="admin_broadcast"))
+        builder.row(CallbackButton(text="📈 История рассылок", callback_data="admin_history", payload="admin_history"))
+        builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
+        
+        await event.message.answer(
+            "🔧 <b>Панель администратора</b>\n\nВыберите действие:",
+            attachments=[builder.as_markup()]
+        )
+    
+    elif callback_data == "cancel_broadcast":
+        if user_id in user_states:
+            del user_states[user_id]
+        
+        # Сбрасываем состояние в БД на предыдущее
+        try:
+            await db.save_user(
+                user_id=user_id,
+                state='awaiting_phone'  # или другое предыдущее состояние
+            )
+        except Exception as e:
+            logger.error(f"Failed to reset state in DB: {e}")
+        
+        await event.message.answer("❌ Рассылка отменена.")
+    
+    elif callback_data == "confirm_broadcast":
+        if user_id not in user_states or user_states.get(user_id) != 'awaiting_broadcast_confirm':
+            await event.message.answer("❌ Сессия рассылки истекла. Начните заново.")
+            return
+
+        broadcast_text = user_states.get(f"{user_id}_broadcast_text", "")
+        if not broadcast_text:
+            await event.message.answer("❌ Текст рассылки не найден.")
+            del user_states[user_id]
+            return
+
+        # Запускаем рассылку
+        await event.message.answer("📨 <b>Рассылка запущена!</b>\n⏳ Пожалуйста, подождите...")
+
+        try:
+            result = await admin_service.send_broadcast(
+                message_text=broadcast_text,
+                sender_id=user_id,
+                exclude_sender=True
+            )
+
+            # Отправляем результат
+            result_message = format_broadcast_result(result)
+            await event.message.answer(result_message)
+
+            # Возвращаем состояние в БД
+            await db.save_user(
+                user_id=user_id,
+                state='registered'
+            )
+
+        except Exception as e:
+            logger.error(f"Broadcast failed: {e}")
+            await event.message.answer(f"❌ Ошибка при рассылке: {str(e)}")
+
+        finally:
+            # Очищаем состояние
+            if user_id in user_states:
+                del user_states[user_id]
+            if f"{user_id}_broadcast_text" in user_states:
+                del user_states[f"{user_id}_broadcast_text"]
 
 # ============= Обработчики обновлений =============
 
@@ -675,9 +952,9 @@ async def handle_all_messages(event: MessageCreated):
     if phone:
         logger.info(f"Phone extracted from contact: {phone[:4]}****")
     
-    # Игнорируем команды
+    # Игнорируем команды (кроме уже обработанных)
     if text and text.startswith('/'):
-        logger.debug(f"Ignoring command: {text}")
+        logger.debug(f"Ignoring command in general handler: {text}")
         return
     
     # Получаем пользователя из БД
@@ -721,21 +998,129 @@ async def handle_all_messages(event: MessageCreated):
             )
         return
     
-    # Если уже зарегистрирован
-    if user.get('registration_status') == 'completed':
-        logger.info(f"User {user_id} is already registered")
+    state = user.get('state') or user_states.get(user_id, 'awaiting_phone')
+    logger.info(f"User {user_id} current state: {state}")
+    
+    # ========== ПРИОРИТЕТНАЯ ПРОВЕРКА: СОСТОЯНИЯ РАССЫЛКИ ==========
+    
+    # Обработка состояния ожидания текста рассылки
+    if state == 'awaiting_broadcast':
+        if not config.bot.is_admin(user_id):
+            logger.warning(f"Non-admin user {user_id} in broadcast state")
+            del user_states[user_id]
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+        
+        if not text:
+            await event.message.answer("📝 Пожалуйста, отправьте текст сообщения для рассылки.")
+            return
+        
+        # Сохраняем текст рассылки
+        user_states[f"{user_id}_broadcast_text"] = text
+        user_states[user_id] = 'awaiting_broadcast_confirm'
+        
+        # Показываем превью и запрашиваем подтверждение
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(
+            text="✅ Отправить всем", 
+            callback_data="confirm_broadcast", 
+            payload="confirm_broadcast"
+        ))
+        builder.row(CallbackButton(
+            text="❌ Отмена", 
+            callback_data="cancel_broadcast", 
+            payload="cancel_broadcast"
+        ))
+        
+        preview = text[:500] + "..." if len(text) > 500 else text
+        
         await event.message.answer(
-            "✅ Вы уже зарегистрированы!\n"
-            "До встречи на мероприятии!"
+            "📨 Предпросмотр рассылки:\n\n"
+            f"{preview}\n\n"
+            "Подтвердите отправку всем пользователям:",
+            attachments=[builder.as_markup()]
+        )
+        logger.info(f"Broadcast preview shown to admin {user_id}")
+        return
+    
+    # Обработка состояния подтверждения рассылки
+    if state == 'awaiting_broadcast_confirm':
+        await event.message.answer(
+            "⚠️ Пожалуйста, используйте кнопки выше для подтверждения или отмены рассылки."
         )
         return
     
-    state = user.get('state') or user_states.get(user_id, 'awaiting_phone')
-    logger.info(f"User {user_id} current state: {state}")
+    # ========== КОНЕЦ ПРОВЕРКИ СОСТОЯНИЙ РАССЫЛКИ ==========
+    
+    # Если уже зарегистрирован
+    if user.get('registration_status') == 'completed':
+        logger.info(f"User {user_id} is already registered")
+
+        # Получаем телефон из сообщения, если есть
+        phone = extract_phone_from_message(event.message)
+        if not phone and text:
+            # Проверяем, похоже ли сообщение на телефон
+            clean = re.sub(r'[^\d]', '', text)
+            if len(clean) >= 10:
+                phone = text
+            
+        # Пробуем получить QR-код
+        qr_url = await get_qr_for_user(user_id, phone)
+
+        if qr_url:
+            await event.message.answer(
+                "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                "Покажите данный QR–код при посещении мероприятий.\n"
+                f"{qr_url}"
+            )
+        else:
+            await event.message.answer(
+                "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                "Покажите данный QR–код при посещении мероприятий.\n"
+                f"{qr_url}"
+            )
+        return
     
     # Обработка состояния ожидания телефона
     if state == 'awaiting_phone':
         logger.info(f"Processing phone input for user {user_id}")
+        
+        # Сначала проверяем, не зарегистрирован ли уже пользователь по phone
+        if phone:
+            clean_phone = re.sub(r'[^\d]', '', phone)
+            existing_registration = await db.get_registration_by_phone(clean_phone)
+        elif text:
+            clean_text = re.sub(r'[^\d]', '', text)
+            if len(clean_text) >= 10:
+                existing_registration = await db.get_registration_by_phone(clean_text)
+            else:
+                existing_registration = None
+        else:
+            existing_registration = None
+        
+        if existing_registration:
+            logger.info(f"User already registered with this phone, sending QR code")
+            
+            # Получаем QR-код для найденной регистрации
+            qr_url = await get_qr_for_user(existing_registration['user_id'], phone or text)
+            
+            if qr_url:
+                await event.message.answer(
+                    "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                    "Покажите данный QR–код при посещении мероприятий.\n"
+                    f"{qr_url}"
+                )
+            else:
+                await event.message.answer(
+                    "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                    "Покажите данный QR–код при посещении мероприятий.\n"
+                    f"{qr_url}"
+                )
+            return
 
         # Если есть контакт - используем его
         if phone:
@@ -1001,7 +1386,8 @@ async def handle_all_messages(event: MessageCreated):
                 phone=user.get('phone', ''),
                 email=user.get('email', ''),
                 inn=validated_inn,
-                event_name=config.bot.event_name
+                event_name=config.bot.event_name,
+                bitrix_id=bitrix_id
             )
             logger.info(f"Registration saved for user {user_id}, reg_id: {reg_id}")
             
@@ -1017,27 +1403,26 @@ async def handle_all_messages(event: MessageCreated):
         if user_id in user_states:
             del user_states[user_id]
         
-        success_message = "🎉 Отлично! Вы успешно зарегистрированы на мероприятие!\n\n"
-        
         if bitrix_id:
-            success_message += f"🆔 Ваш ID регистрации: <b>{bitrix_id}</b>\n"
-            success_message += "📱 Покажите этот номер при входе на мероприятие.\n\n"
-        
-        if not is_fallback and company_data:
-            success_message += f"🏢 Организация: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
-        
-        success_message += "\nМы свяжемся с вами по указанному номеру телефона. До встречи! 👋"
-        
-        await event.message.answer(success_message)
-        
-        if bitrix_id:
+            # Кодируем ID в ссылку на сайт
+            qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={qr_data}"
+            
             await event.message.answer(
-                f"🔢 Ваш ID для входа: <code>{bitrix_id}</code>\n\n"
-                "Сохраните этот номер!"
+                f"🔳 Ваш QR-код для входа:\n{qr_url}\n\n"
+                f"🆔 ID: <code>{bitrix_id}</code>\n\n"
+                "📱 Сохраните это изображение и покажите при входе на мероприятие!"
             )
+            logger.info(f"QR code link sent to user {user_id}")
+
+        
+                
+        
         
         logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****, ID: {bitrix_id}")
         return
+    
+    
     
     # Fallback
     logger.warning(f"User {user_id} in unexpected state: {state}, sending fallback")
@@ -1104,13 +1489,73 @@ def get_company_type_and_name(validation_result: dict, company_data: dict, name:
         # Самозанятый или другой тип
         return 'unknown', name
 
+
+async def get_qr_for_user(user_id: int, phone: str = None) -> Optional[str]:
+    """Получение QR-кода для уже зарегистрированного пользователя"""
+    try:
+        logger.info(f"Getting QR code for user {user_id}")
+        
+        # Ищем регистрацию по user_id
+        registration = await db.get_last_registration(user_id)
+        
+        # Если не нашли по user_id, но есть телефон - ищем по телефону
+        if not registration and phone:
+            logger.info(f"No registration by user_id, searching by phone")
+            # Очищаем телефон от форматирования для поиска
+            clean_phone = re.sub(r'[^\d]', '', phone)
+            registration = await db.get_registration_by_phone(clean_phone)
+        
+        if not registration:
+            logger.warning(f"No registration found for user {user_id}")
+            return None
+        
+        logger.info(f"Registration found: {registration}")
+        
+        # Проверяем bitrix_id
+        bitrix_id = registration.get('bitrix_id')
+        
+        if not bitrix_id:
+            logger.warning(f"No bitrix_id in registration, generating local ID")
+            # Генерируем ID из данных регистрации
+            import hashlib
+            
+            # Очищаем телефон от форматирования
+            reg_phone = registration.get('phone', '')
+            clean_reg_phone = re.sub(r'[^\d]', '', reg_phone)
+            
+            reg_inn = registration.get('inn', '')
+            
+            if clean_reg_phone and reg_inn:
+                raw = f"{clean_reg_phone}_{reg_inn}"
+                local_id = hashlib.md5(raw.encode()).hexdigest()[:8].upper()
+                bitrix_id = f"DP-{local_id}"
+                logger.info(f"Generated local ID: {bitrix_id}")
+                
+                # Сохраняем сгенерированный ID в базу
+                await db.update_registration_bitrix_id(registration['id'], bitrix_id)
+            else:
+                logger.error(f"Cannot generate QR: missing phone or INN")
+                return None
+        
+        # Формируем URL для QR-кода
+        qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={qr_data}"
+        
+        logger.info(f"QR URL generated: {qr_url}")
+        return qr_url
+        
+    except Exception as e:
+        logger.error(f"Failed to generate QR for user {user_id}: {e}\n{traceback.format_exc()}")
+        return None
+
+
         
 # ============= Запуск =============
 
 async def main():
     """Запуск бота"""
     print("\n" + "=" * 50)
-    print("🤖 MAX Registration Bot")
+    print(" MAX Registration Bot")
     print("=" * 50)
     
     logger.info("=" * 50)

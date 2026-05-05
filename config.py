@@ -108,3 +108,23 @@ class AppConfig:
     def get_max_log_size_bytes(self) -> int:
         """Получение максимального размера лог-файла в байтах"""
         return self.logging.max_log_size_mb * 1024 * 1024
+    
+    
+@dataclass(frozen=True)
+class AdminConfig:
+    """Конфигурация административного сервиса"""
+    broadcast_delay: float = field(default_factory=lambda: float(os.getenv('BROADCAST_DELAY', '0.05')))
+    broadcast_batch_size: int = field(default_factory=lambda: int(os.getenv('BROADCAST_BATCH_SIZE', '100')))
+    broadcast_history_limit: int = field(default_factory=lambda: int(os.getenv('BROADCAST_HISTORY_LIMIT', '10')))
+    cleanup_broadcast_after: int = field(default_factory=lambda: int(os.getenv('CLEANUP_BROADCAST_AFTER', '3600')))
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Основная конфигурация приложения"""
+    bot: BotConfig = field(default_factory=BotConfig)
+    db: DatabaseConfig = field(default_factory=DatabaseConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    dadata: DadataConfig = field(default_factory=DadataConfig)
+    bitrix: BitrixConfig = field(default_factory=BitrixConfig)
+    admin: AdminConfig = field(default_factory=AdminConfig)  # ← добавить

@@ -288,6 +288,41 @@ class Database:
                 """)
                 logger.info("✅ Table 'registrations' created/verified")
                 
+                logger.debug("Adding bitrix_id column to registrations if not exists...")
+                try:
+                    await cur.execute("""
+                        ALTER TABLE registrations 
+                        ADD COLUMN bitrix_id VARCHAR(50) COMMENT 'Bitrix24 registration ID'
+                    """)
+                    logger.info("✅ Column 'bitrix_id' added to registrations")
+                except Exception as e:
+                    # Если колонка уже существует, MySQL выдаст ошибку, которую мы игнорируем
+                    if "Duplicate column name" in str(e):
+                        logger.debug("Column 'bitrix_id' already exists in registrations")
+                    else:
+                        logger.warning(f"Could not add bitrix_id column: {e}")
+        
+                # Таблица статистики рассылок
+                logger.debug("Creating/verifying 'broadcast_stats' table...")
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS broadcast_stats (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        broadcast_id VARCHAR(50) UNIQUE NOT NULL COMMENT 'Broadcast ID',
+                        admin_id BIGINT NOT NULL COMMENT 'Admin user ID',
+                        total_users INT DEFAULT 0 COMMENT 'Total recipients',
+                        successful INT DEFAULT 0 COMMENT 'Successfully sent',
+                        failed INT DEFAULT 0 COMMENT 'Failed to send',
+                        blocked INT DEFAULT 0 COMMENT 'Blocked bot',
+                        status VARCHAR(20) DEFAULT 'completed' COMMENT 'Broadcast status',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Creation time',
+                        INDEX idx_broadcast_id (broadcast_id),
+                        INDEX idx_admin_id (admin_id),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    COMMENT='Broadcast statistics'
+                """)
+                logger.info("✅ Table 'broadcast_stats' created/verified")
+                
                 # Проверяем структуру таблиц
                 await self._verify_tables_structure(cur)
                 
@@ -307,6 +342,11 @@ class Database:
         reg_columns = await cur.fetchall()
         logger.debug(f"Registrations table has {len(reg_columns)} columns")
         
+        # Проверяем broadcast_stats (ДОБАВИТЬ)
+        await cur.execute("DESCRIBE broadcast_stats")
+        broadcast_columns = await cur.fetchall()
+        logger.debug(f"Broadcast_stats table has {len(broadcast_columns)} columns")
+        
         # Проверяем индексы
         await cur.execute("SHOW INDEX FROM users")
         users_indexes = await cur.fetchall()
@@ -315,6 +355,11 @@ class Database:
         await cur.execute("SHOW INDEX FROM registrations")
         reg_indexes = await cur.fetchall()
         logger.debug(f"Registrations table has {len(reg_indexes)} indexes")
+        
+        # Проверяем индексы broadcast_stats (ДОБАВИТЬ)
+        await cur.execute("SHOW INDEX FROM broadcast_stats")
+        broadcast_indexes = await cur.fetchall()
+        logger.debug(f"Broadcast_stats table has {len(broadcast_indexes)} indexes")
     
     @db_error_handler
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -419,11 +464,11 @@ class Database:
         phone: str,
         email: str,
         inn: str,
-        event_name: str
+        event_name: str,
+        bitrix_id: str = None
     ) -> int:
         """Сохранение регистрации"""
         logger.info(f"Saving registration for user {user_id}")
-        logger.debug(f"  email: {email}" if email else "  email: None")
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cur:
@@ -440,11 +485,11 @@ class Database:
                     logger.warning(f"User {user_id} already registered for event '{event_name}'")
                     return existing[0]
 
-                # Сохраняем регистрацию
+                # Сохраняем регистрацию с bitrix_id (добавьте поле в таблицу)
                 await cur.execute("""
-                    INSERT INTO registrations (user_id, chat_id, name, phone, email, inn, event_name)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (user_id, chat_id, name, phone, email, inn, event_name))
+                    INSERT INTO registrations (user_id, chat_id, name, phone, email, inn, event_name, bitrix_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (user_id, chat_id, name, phone, email, inn, event_name, bitrix_id))
 
                 reg_id = cur.lastrowid
                 logger.info(f"✅ Registration record created: id={reg_id}")
@@ -689,6 +734,72 @@ class Database:
                 logger.debug(f"Health check completed: {health['status']}")
                 return health
     
+    @db_error_handler
+    async def save_broadcast_stats(
+        self,
+        broadcast_id: str,
+        admin_id: int,
+        total_users: int,
+        successful: int,
+        failed: int,
+        blocked: int,
+        status: str = 'completed'
+    ) -> None:
+        """Сохранение статистики рассылки"""
+        logger.info(f"Saving broadcast stats: {broadcast_id}")
+        
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                self.query_count += 1
+                
+                await cur.execute("""
+                    INSERT INTO broadcast_stats 
+                    (broadcast_id, admin_id, total_users, successful, failed, blocked, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    total_users = VALUES(total_users),
+                    successful = VALUES(successful),
+                    failed = VALUES(failed),
+                    blocked = VALUES(blocked),
+                    status = VALUES(status)
+                """, (broadcast_id, admin_id, total_users, successful, failed, blocked, status))
+                
+                logger.info(f"✅ Broadcast stats saved: {broadcast_id}")
+    
+    @db_error_handler
+    async def get_broadcast_stats(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Получение статистики последних рассылок"""
+        logger.debug(f"Getting last {limit} broadcast stats")
+        
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
+                
+                await cur.execute("""
+                    SELECT 
+                        broadcast_id,
+                        admin_id,
+                        total_users,
+                        successful,
+                        failed,
+                        blocked,
+                        status,
+                        created_at
+                    FROM broadcast_stats
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+                
+                stats = await cur.fetchall()
+                logger.info(f"Retrieved {len(stats)} broadcast stats records")
+                
+                # Преобразуем datetime в строку
+                for stat in stats:
+                    if stat.get('created_at'):
+                        stat['created_at'] = stat['created_at'].isoformat()
+                
+                return stats
+            
     def get_log_files_info(self) -> Dict[str, Any]:
         """Получение информации о лог-файлах базы данных"""
         try:
@@ -717,6 +828,100 @@ class Database:
             return {'error': str(e)}
 
 
+    @db_error_handler
+    async def get_last_registration(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получение последней регистрации пользователя"""
+        logger.debug(f"Getting last registration for user {user_id}")
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
+
+                await cur.execute("""
+                    SELECT * FROM registrations 
+                    WHERE user_id = %s 
+                    ORDER BY registration_date DESC 
+                    LIMIT 1
+                """, (user_id,))
+
+                registration = await cur.fetchone()
+
+                if registration:
+                    logger.debug(f"Found registration for user {user_id}")
+                else:
+                    logger.debug(f"No registration found for user {user_id}")
+
+                return registration
+
+    @db_error_handler
+    async def get_registration_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
+        """Поиск регистрации по номеру телефона (ищет в форматированном и сыром виде)"""
+        logger.debug(f"Searching registration by phone: {phone[:4]}****")
+        
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
+                
+                # Ищем телефон в базе (может быть в формате +7 (XXX) XXX-XX-XX или просто цифры)
+                # Используем REGEXP для поиска телефона без учета форматирования
+                await cur.execute("""
+                    SELECT * FROM registrations 
+                    WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '+', ''), '(', ''), ')', ''), '-', ''), ' ', '') = %s
+                    ORDER BY registration_date DESC 
+                    LIMIT 1
+                """, (phone,))
+                
+                registration = await cur.fetchone()
+                
+                if registration:
+                    logger.info(f"Found registration by phone for user {registration.get('user_id')}")
+                else:
+                    logger.info(f"No registration found by phone")
+                
+                return registration
+    
+    @db_error_handler
+    async def update_registration_bitrix_id(self, registration_id: int, bitrix_id: str) -> None:
+        """Обновление bitrix_id в регистрации"""
+        logger.debug(f"Updating bitrix_id for registration {registration_id}: {bitrix_id}")
+        
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                self.query_count += 1
+                
+                await cur.execute("""
+                    UPDATE registrations 
+                    SET bitrix_id = %s 
+                    WHERE id = %s
+                """, (bitrix_id, registration_id))
+                
+                logger.info(f"✅ bitrix_id updated for registration {registration_id}")
+    
+    @db_error_handler
+    async def get_last_registration(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получение последней регистрации пользователя"""
+        logger.debug(f"Getting last registration for user {user_id}")
+        
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                self.query_count += 1
+                
+                await cur.execute("""
+                    SELECT * FROM registrations 
+                    WHERE user_id = %s 
+                    ORDER BY registration_date DESC 
+                    LIMIT 1
+                """, (user_id,))
+                
+                registration = await cur.fetchone()
+                
+                if registration:
+                    logger.debug(f"Found registration for user {user_id}")
+                else:
+                    logger.debug(f"No registration found for user {user_id}")
+                
+                return registration
+    
 # Для отладки
 async def test_connection():
     """Тест подключения к БД"""
@@ -767,6 +972,7 @@ async def test_connection():
     except Exception as e:
         print(f"\n❌ Test failed: {e}")
         print(traceback.format_exc())
+
 
 
 if __name__ == '__main__':
