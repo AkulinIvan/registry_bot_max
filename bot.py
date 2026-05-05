@@ -23,6 +23,20 @@ from database import Database
 from bitrix_client import BitrixClient
 from admin_service import AdminService, format_broadcast_result
 
+
+logger = logging.getLogger(__name__)
+import maxapi.types.attachments as attachments_module
+logger.info(f"Available in attachments: {dir(attachments_module)}")
+
+
+
+# Посмотрите что доступно в image модуле
+try:
+    import maxapi.types.attachments.image as image_module
+    logger.info(f"Available in image: {dir(image_module)}")
+except:
+    pass
+
 # Настройка логирования
 config = AppConfig()
 
@@ -468,7 +482,7 @@ async def admin_command(event: MessageCreated):
     builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
     
     await event.message.answer(
-        "🔧 <b>Панель администратора</b>\n\n"
+        "🔧 Панель администратора\n\n"
         "Выберите действие:",
         attachments=[builder.as_markup()]
     )
@@ -690,21 +704,16 @@ async def handle_callback(event: MessageCallback):
     elif callback_data == "menu_announcements":
         await event.message.answer(
             "📢 Анонсы мероприятий\n\n"
-            "Ближайшие мероприятия:\n"
-            "• 15 июня - Мастер-класс по маркетингу\n"
-            "• 22 июня - Нетворкинг-встреча\n"
-            "• 1 июля - Бизнес-завтрак с экспертами\n\n"
-            "Следите за обновлениями!",
+            "Смотрите программу мероприятий на сайте:\n"
+            f"дни-предпринимательства.рф",
             attachments=[get_back_keyboard()]
         )
     
     elif callback_data == "menu_collaboration":
         await event.message.answer(
             "🤝 Хочу коллаборацию\n\n"
-            "Для поиска партнеров и коллабораций:\n\n"
-            "📧 Email: collaboration@example.com\n"
-            "📱 Telegram: @collab_manager\n\n"
-            "Или заполните форму на сайте.",
+            "Для поиска партнеров и коллабораций переходите в наш чат:\n\n"
+            f"https://max.ru/join/wRFl6wnGv0s9HiX9dDIDLo1CfxgAgSZLzC6Dv2iRwuY",
             attachments=[get_back_keyboard()]
         )
     
@@ -724,7 +733,7 @@ async def handle_callback(event: MessageCallback):
         db_stats = await db.get_stats()
         user_counts = await admin_service.get_user_count()
         
-        message = "📊 <b>Статистика бота</b>\n\n"
+        message = "📊 Статистика бота\n\n"
         message += "Пользователи:\n"
         message += f"👥 Всего: {user_counts['total']}\n"
         message += f"✅ Зарегистрировано: {user_counts['completed']}\n"
@@ -804,7 +813,7 @@ async def handle_callback(event: MessageCallback):
         builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
         
         await event.message.answer(
-            "🔧 <b>Панель администратора</b>\n\nВыберите действие:",
+            "🔧 Панель администратора\n\nВыберите действие:",
             attachments=[builder.as_markup()]
         )
     
@@ -835,7 +844,7 @@ async def handle_callback(event: MessageCallback):
             return
 
         # Запускаем рассылку
-        await event.message.answer("📨 <b>Рассылка запущена!</b>\n⏳ Пожалуйста, подождите...")
+        await event.message.answer("📨 Рассылка запущена!\n⏳ Пожалуйста, подождите...")
 
         try:
             result = await admin_service.send_broadcast(
@@ -1056,37 +1065,36 @@ async def handle_all_messages(event: MessageCreated):
     if user.get('registration_status') == 'completed':
         logger.info(f"User {user_id} is already registered")
 
-        # Получаем телефон из сообщения, если есть
         phone = extract_phone_from_message(event.message)
         if not phone and text:
-            # Проверяем, похоже ли сообщение на телефон
             clean = re.sub(r'[^\d]', '', text)
             if len(clean) >= 10:
                 phone = text
-            
-        # Пробуем получить QR-код
-        qr_url = await get_qr_for_user(user_id, phone)
 
-        if qr_url:
-            await event.message.answer(
+        qr_result = await get_qr_image_for_user(user_id, phone)
+
+        if qr_result:
+            qr_bytes, bitrix_id = qr_result
+            message_text = (
                 "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                "Покажите данный QR–код при посещении мероприятий.\n"
-                f"{qr_url}"
+                "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                "Покажите данный QR–код при посещении мероприятий."
             )
+            await send_qr_image(event, qr_bytes, bitrix_id, message_text)
         else:
             await event.message.answer(
                 "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                "Покажите данный QR–код при посещении мероприятий.\n"
-                f"{qr_url}"
+                "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                "Если вам нужен QR-код, обратитесь к организаторам."
             )
         return
     
     # Обработка состояния ожидания телефона
     if state == 'awaiting_phone':
         logger.info(f"Processing phone input for user {user_id}")
-        
+
         # Сначала проверяем, не зарегистрирован ли уже пользователь по phone
         if phone:
             clean_phone = re.sub(r'[^\d]', '', phone)
@@ -1099,26 +1107,29 @@ async def handle_all_messages(event: MessageCreated):
                 existing_registration = None
         else:
             existing_registration = None
-        
+
         if existing_registration:
             logger.info(f"User already registered with this phone, sending QR code")
-            
-            # Получаем QR-код для найденной регистрации
-            qr_url = await get_qr_for_user(existing_registration['user_id'], phone or text)
-            
-            if qr_url:
-                await event.message.answer(
+
+            qr_result = await get_qr_image_for_user(
+                existing_registration['user_id'], 
+                phone or text
+            )
+
+            if qr_result:
+                qr_bytes, bitrix_id = qr_result
+                message_text = (
                     "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                    "Покажите данный QR–код при посещении мероприятий.\n"
-                    f"{qr_url}"
+                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                    "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                    "Покажите данный QR–код при посещении мероприятий."
                 )
+                await send_qr_image(event, qr_bytes, bitrix_id, message_text)
             else:
                 await event.message.answer(
                     "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                    "Покажите данный QR–код при посещении мероприятий.\n"
-                    f"{qr_url}"
+                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                    "программа форума и регистрация на сайте дни-предпринимательства.рф"
                 )
             return
 
@@ -1404,24 +1415,40 @@ async def handle_all_messages(event: MessageCreated):
             del user_states[user_id]
         
         if bitrix_id:
-            # Кодируем ID в ссылку на сайт
-            qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={qr_data}"
-            
-            await event.message.answer(
-                f"🔳 Ваш QR-код для входа:\n{qr_url}\n\n"
-                f"🆔 ID: <code>{bitrix_id}</code>\n\n"
-                "📱 Сохраните это изображение и покажите при входе на мероприятие!"
-            )
-            logger.info(f"QR code link sent to user {user_id}")
+            import qrcode
+            import io
 
-        
-                
-        
+            qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=10,
+                border=2,
+            )
+            qr.add_data(qr_data)
+            qr.make(fit=True)
+
+            img = qr.make_image(fill_color="black", back_color="white")
+            img = img.resize((300, 300))
+
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+
+            message_text = (
+                "🎉 Регистрация успешно завершена!\n\n"
+                "Вы зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                "Покажите данный QR–код при посещении мероприятий."
+            )
+
+            await send_qr_image(event, img_bytes.getvalue(), bitrix_id, message_text)
+            logger.info(f"QR code sent to user {user_id}")
         
         logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****, ID: {bitrix_id}")
         return
-    
     
     
     # Fallback
@@ -1490,10 +1517,10 @@ def get_company_type_and_name(validation_result: dict, company_data: dict, name:
         return 'unknown', name
 
 
-async def get_qr_for_user(user_id: int, phone: str = None) -> Optional[str]:
-    """Получение QR-кода для уже зарегистрированного пользователя"""
+async def get_qr_image_for_user(user_id: int, phone: str = None) -> Optional[tuple]:
+    """Получение QR-кода как изображения для пользователя. Возвращает (bytes, bitrix_id)"""
     try:
-        logger.info(f"Getting QR code for user {user_id}")
+        logger.info(f"Generating QR image for user {user_id}")
         
         # Ищем регистрацию по user_id
         registration = await db.get_last_registration(user_id)
@@ -1501,7 +1528,6 @@ async def get_qr_for_user(user_id: int, phone: str = None) -> Optional[str]:
         # Если не нашли по user_id, но есть телефон - ищем по телефону
         if not registration and phone:
             logger.info(f"No registration by user_id, searching by phone")
-            # Очищаем телефон от форматирования для поиска
             clean_phone = re.sub(r'[^\d]', '', phone)
             registration = await db.get_registration_by_phone(clean_phone)
         
@@ -1516,13 +1542,10 @@ async def get_qr_for_user(user_id: int, phone: str = None) -> Optional[str]:
         
         if not bitrix_id:
             logger.warning(f"No bitrix_id in registration, generating local ID")
-            # Генерируем ID из данных регистрации
             import hashlib
             
-            # Очищаем телефон от форматирования
             reg_phone = registration.get('phone', '')
             clean_reg_phone = re.sub(r'[^\d]', '', reg_phone)
-            
             reg_inn = registration.get('inn', '')
             
             if clean_reg_phone and reg_inn:
@@ -1537,18 +1560,92 @@ async def get_qr_for_user(user_id: int, phone: str = None) -> Optional[str]:
                 logger.error(f"Cannot generate QR: missing phone or INN")
                 return None
         
-        # Формируем URL для QR-кода
-        qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
-        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={qr_data}"
+        # Генерируем QR-код
+        import qrcode
+        import io
         
-        logger.info(f"QR URL generated: {qr_url}")
-        return qr_url
+        qr_data = f"https://bitrix.nneto.ru/?id={bitrix_id}"
+        
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        img = img.resize((300, 300))
+        
+        # Сохраняем в байты
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        
+        logger.info(f"QR image generated for user {user_id}, ID: {bitrix_id}")
+        return img_bytes.getvalue(), bitrix_id
         
     except Exception as e:
         logger.error(f"Failed to generate QR for user {user_id}: {e}\n{traceback.format_exc()}")
         return None
 
-
+async def send_qr_image(event, qr_bytes: bytes, bitrix_id: str, message_text: str):
+    """Отправка QR-кода как изображения"""
+    
+    # Сначала посмотрим, какие классы доступны
+    from maxapi.types.attachments import Image, File
+    import maxapi.types.attachments as att_module
+    
+    # Логируем содержимое модуля
+    logger.info(f"Image class fields: {Image.__fields__.keys() if hasattr(Image, '__fields__') else 'no __fields__'}")
+    logger.info(f"Image class annotations: {Image.__annotations__ if hasattr(Image, '__annotations__') else 'no __annotations__'}")
+    
+    # Пробуем создать Image правильно
+    try:
+        # Вариант 1: Создаем с type='image'
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=https://bitrix.neto.ru/?id={bitrix_id}"
+        
+        # Попробуем разные способы создания
+        img = Image(type='image', payload={'url': qr_url})
+        
+        await event.message.answer(
+            text=f"{message_text}\n\n🆔 ID: {bitrix_id}",
+            attachments=[img]
+        )
+        logger.info("QR sent with Image type='image'")
+        return
+        
+    except Exception as e:
+        logger.warning(f"Variant 1 failed: {e}")
+    
+    try:
+        # Вариант 2: Используем File вместо Image
+        from maxapi.types.attachments import File
+        
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=https://bitrix.neto.ru/?id={bitrix_id}"
+        
+        file_attachment = File(
+            type='file',
+            payload={'url': qr_url},
+            filename=f'qr_{bitrix_id}.png'
+        )
+        
+        await event.message.answer(
+            text=f"{message_text}\n\n🆔 ID: {bitrix_id}",
+            attachments=[file_attachment]
+        )
+        logger.info("QR sent with File attachment")
+        return
+        
+    except Exception as e:
+        logger.warning(f"Variant 2 failed: {e}")
+    
+    # Вариант 3: Просто URL
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=https://bitrix.neto.ru/?id={bitrix_id}"
+    await event.message.answer(
+        f"{message_text}\n\n{qr_url}\n\n🆔 ID: {bitrix_id}"
+    )
         
 # ============= Запуск =============
 
