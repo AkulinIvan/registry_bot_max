@@ -196,8 +196,8 @@ def validate_phone(phone: str) -> Optional[ValidatedPhone]:
 
 
 async def validate_inn(inn: str) -> Optional[Dict[str, Any]]:
-    """Расширенная валидация ИНН через DaData API"""
-    logger.debug(f"Validating INN with DaData: {inn[:4] if inn else 'empty'}****")
+    """Валидация ИНН с проверкой типа (юрлицо, ИП, самозанятый, физлицо)"""
+    logger.debug(f"Validating INN: {inn[:4] if inn else 'empty'}****")
     
     if not inn:
         logger.warning("INN validation failed: empty INN")
@@ -211,44 +211,83 @@ async def validate_inn(inn: str) -> Optional[Dict[str, Any]]:
     
     try:
         async with DadataClient() as dadata:
+            # Сначала пробуем найти в DaData
             company = await dadata.find_company_by_inn(clean)
             
             if company:
                 logger.info(f"✅ Company found via DaData: {company['name']['short']}")
                 
-                # Проверяем, активна ли компания
-                if not company['is_active']:
-                    logger.warning(f"Company {clean[:4]}**** is not active: {company['state']['status']}")
-                    return {
-                        "valid": False,
-                        "error": "company_inactive",
-                        "status": company['state']['status'],
-                        "company": company
-                    }
+                # Определяем тип
+                raw_type = company.get('type', '').upper()
+                
+                if raw_type == 'INDIVIDUAL':
+                    company_type = 'INDIVIDUAL'
+                elif raw_type == 'LEGAL':
+                    company_type = 'LEGAL'
+                else:
+                    company_type = 'FIZ'
                 
                 return {
                     "valid": True,
                     "number": clean,
-                    "type": company['type'].lower(),
-                    "company": company
+                    "type": company_type,
+                    "company": company,
+                    "is_active": company.get('is_active', True),
+                    "state_status": company.get('state', {}).get('status', 'ACTIVE')
                 }
-            else:
-                logger.warning(f"INN {clean[:4]}**** not found in DaData")
-                return {
-                    "valid": False,
-                    "error": "not_found",
-                    "number": clean
-                }
+            
+            # Если не нашли в DaData - проверяем самозанятых (только для 12-значных ИНН)
+            if len(clean) == 12:
+                logger.info(f"INN {clean[:4]}**** not found in DaData, checking NPD status...")
+                npd_result = await dadata.check_npd_status(clean)
+                
+                if npd_result and npd_result.get("is_npd"):
+                    logger.info(f"✅ INN {clean[:4]}**** is NPD (самозанятый)")
+                    return {
+                        "valid": True,
+                        "number": clean,
+                        "type": "NPD",
+                        "company": {
+                            "type": "NPD",
+                            "name": {"short": "Самозанятый", "full": "Самозанятый"},
+                            "is_active": True,
+                            "state": {"status": "ACTIVE"}
+                        },
+                        "is_active": True,
+                        "npd_message": npd_result.get("message", "")
+                    }
+            
+            # Если ничего не нашли - возвращаем FIZ
+            logger.info(f"INN {clean[:4]}**** not found anywhere, returning FIZ type")
+            return {
+                "valid": True,
+                "number": clean,
+                "type": "FIZ",
+                "company": {
+                    "type": "FIZ",
+                    "name": {"short": "Физическое лицо", "full": "Физическое лицо"},
+                    "is_active": True,
+                    "state": {"status": "ACTIVE"}
+                },
+                "is_active": True
+            }
                 
     except Exception as e:
-        logger.error(f"DaData API error for INN {clean[:4]}****: {e}")
-        # Fallback: базовая валидация без DaData
-        inn_type = 'organization' if len(clean) == 10 else 'individual'
-        logger.info(f"Using fallback validation: INN type={inn_type}")
+        logger.error(f"Error during INN validation {clean[:4]}****: {e}")
+        # В случае ошибки - возвращаем FIZ для 12-значных, LEGAL для 10-значных
+        fallback_type = 'FIZ' if len(clean) == 12 else 'LEGAL'
+        logger.info(f"Using fallback type {fallback_type} for INN {clean[:4]}****")
         return {
             "valid": True,
             "number": clean,
-            "type": inn_type,
+            "type": fallback_type,
+            "company": {
+                "type": fallback_type,
+                "name": {"short": "Неизвестно", "full": "Неизвестно"},
+                "is_active": True,
+                "state": {"status": "ACTIVE"}
+            },
+            "is_active": True,
             "fallback": True
         }
 
@@ -696,8 +735,7 @@ async def handle_callback(event: MessageCallback):
         await event.message.answer(
             "📋 Регистрация на форум\n\n"
             "Поделитесь вашим номером телефона.\n\n"
-            "📱 Нажмите кнопку ниже или отправьте номер текстом:\n"
-            "+7 999 123-45-67",
+            "📱 Нажмите кнопку ниже:",
             attachments=[keyboard]
         )
     
@@ -1001,8 +1039,7 @@ async def handle_all_messages(event: MessageCreated):
         if keyboard:
             await event.message.answer(
                 "👋 Добро пожаловать!\n\n"
-                "Нажмите кнопку ниже, чтобы поделиться номером телефона "
-                "или отправьте его вручную в формате: +7 999 123-45-67",
+                "Нажмите кнопку ниже, чтобы поделиться номером телефона ",
                 attachments=[keyboard]
             )
         return
@@ -1095,83 +1132,88 @@ async def handle_all_messages(event: MessageCreated):
     if state == 'awaiting_phone':
         logger.info(f"Processing phone input for user {user_id}")
 
-        # Сначала проверяем, не зарегистрирован ли уже пользователь по phone
+        # Пытаемся извлечь телефон ТОЛЬКО из контакта (кнопка "Поделиться")
+        phone = extract_phone_from_message(event.message)
+
+        # Если телефон получен через кнопку - обрабатываем
         if phone:
+            logger.info(f"Phone from contact button: {phone[:4]}****")
+
+            # Проверяем, не зарегистрирован ли уже пользователь по phone
             clean_phone = re.sub(r'[^\d]', '', phone)
             existing_registration = await db.get_registration_by_phone(clean_phone)
-        elif text:
-            clean_text = re.sub(r'[^\d]', '', text)
-            if len(clean_text) >= 10:
-                existing_registration = await db.get_registration_by_phone(clean_text)
-            else:
-                existing_registration = None
-        else:
-            existing_registration = None
 
-        if existing_registration:
-            logger.info(f"User already registered with this phone, sending QR code")
+            if existing_registration:
+                logger.info(f"User already registered with this phone, sending QR code")
 
-            qr_result = await get_qr_image_for_user(
-                existing_registration['user_id'], 
-                phone or text
-            )
-
-            if qr_result:
-                qr_bytes, bitrix_id = qr_result
-                message_text = (
-                    "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
-                    "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                    "Покажите данный QR–код при посещении мероприятий."
+                qr_result = await get_qr_image_for_user(
+                    existing_registration['user_id'], 
+                    phone
                 )
-                await send_qr_image(event, qr_bytes, bitrix_id, message_text)
-            else:
+
+                if qr_result:
+                    qr_bytes, bitrix_id = qr_result
+                    message_text = (
+                        "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                        "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                        "Покажите данный QR–код при посещении мероприятий."
+                    )
+                    await send_qr_image(event, qr_bytes, bitrix_id, message_text)
+                else:
+                    await event.message.answer(
+                        "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                        "программа форума и регистрация на сайте дни-предпринимательства.рф"
+                    )
+                return
+
+            # Валидируем телефон
+            validated = validate_phone(phone)
+
+            if not validated:
+                logger.warning(f"Invalid phone format for user {user_id}")
+                keyboard = create_phone_keyboard()
                 await event.message.answer(
-                    "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
-                    "программа форума и регистрация на сайте дни-предпринимательства.рф"
+                    "❌ Неверный формат номера.\n"
+                    "Пожалуйста, используйте кнопку ниже, чтобы поделиться номером телефона.",
+                    attachments=[keyboard]
                 )
+                return
+
+            # Сохраняем телефон
+            try:
+                await db.save_user(
+                    user_id=user_id,
+                    phone=validated.number,
+                    state='awaiting_email',
+                    status='pending'
+                )
+                logger.info(f"Phone saved for user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to save phone for user {user_id}: {e}")
+                await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
+                return
+
+            user_states[user_id] = 'awaiting_email'
+            logger.info(f"User {user_id} state changed to 'awaiting_email'")
+
+            await event.message.answer(
+                "📧 Отлично! Теперь отправьте ваш Email адрес:\n"
+                "Например: example@mail.ru"
+            )
             return
 
-        # Если есть контакт - используем его
-        if phone:
-            validated = validate_phone(phone)
-        elif text:
-            validated = validate_phone(text)
+        # Если телефон не получен (пользователь отправил текст вместо контакта)
         else:
-            validated = None
-
-        if not validated:
-            logger.warning(f"Invalid phone format for user {user_id}")
+            logger.warning(f"User {user_id} sent text instead of contact")
             keyboard = create_phone_keyboard()
             await event.message.answer(
-                "❌ Неверный формат номера.\n"
-                "Нажмите кнопку ниже или отправьте номер в формате: +7 999 123-45-67",
+                "📱 Для регистрации необходимо поделиться номером телефона.\n\n"
+                "Пожалуйста, нажмите кнопку ниже:",
                 attachments=[keyboard]
             )
             return
-
-        try:
-            await db.save_user(
-                user_id=user_id,
-                phone=validated.number,
-                state='awaiting_email',
-                status='pending'
-            )
-            logger.info(f"Phone saved for user {user_id}")
-        except Exception as e:
-            logger.error(f"Failed to save phone for user {user_id}: {e}")
-            await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
-            return
-
-        user_states[user_id] = 'awaiting_email'
-        logger.info(f"User {user_id} state changed to 'awaiting_email'")
-
-        await event.message.answer(
-            "📧 Отлично! Теперь отправьте ваш Email адрес:\n"
-            "Например: example@mail.ru"
-        )
-        return
     
     # Обработка состояния ожидания Email
     elif state == 'awaiting_email':
@@ -1280,116 +1322,139 @@ async def handle_all_messages(event: MessageCreated):
     # Обработка состояния ожидания ИНН
     elif state == 'awaiting_inn':
         logger.info(f"Processing INN input for user {user_id}")
-        
+
         if not text:
             logger.warning(f"No text provided for INN by user {user_id}")
             await event.message.answer(
                 "📋 Пожалуйста, отправьте ИНН текстом:\n"
                 "• 10 цифр для организации\n"
-                "• 12 цифр для ИП"
+                "• 12 цифр для ИП или самозанятого"
             )
             return
-        
+
         # Отправляем сообщение о проверке
-        checking_msg = await event.message.answer("🔍 Проверяем ИНН через базу ФНС...")
-        
-        # Расширенная валидация через DaData
+        checking_msg = await event.message.answer("🔍 Проверяем ИНН...")
+
+        # Валидация ИНН (без блокировки)
         validation_result = await validate_inn(text)
-        
+
         if not validation_result or not validation_result.get("valid"):
-            error_type = validation_result.get("error") if validation_result else "invalid_format"
-            
-            if error_type == "company_inactive":
-                status = validation_result.get("status", "неизвестно")
-                company = validation_result.get("company", {})
-                await event.message.answer(
-                    f"⚠️ Компания с ИНН {text} имеет статус: {status}\n"
-                    f"📌 {company.get('name', {}).get('short', 'Неизвестно')}\n\n"
-                    "Регистрация возможна только для действующих организаций и ИП.\n"
-                    "Если это ошибка, свяжитесь с организаторами."
-                )
-            elif error_type == "not_found":
-                await event.message.answer(
-                    f"❌ ИНН {text} не найден в базе ФНС.\n"
-                    "Проверьте правильность ввода и попробуйте ещё раз:"
-                )
-            else:
-                await event.message.answer(
-                    "❌ Неверный ИНН. Должно быть 10 или 12 цифр.\n"
-                    "Попробуйте ещё раз:"
-                )
+            await event.message.answer(
+                "❌ Неверный ИНН. Должно быть 10 или 12 цифр.\n"
+                "Попробуйте ещё раз:"
+            )
             return
-        
+
         validated_inn = validation_result["number"]
+        inn_type = validation_result["type"]
         company_data = validation_result.get("company", {})
         is_fallback = validation_result.get("fallback", False)
-        
+
+        # Показываем результат проверки
+        type_descriptions = {
+            'LEGAL': 'Юридическое лицо',
+            'INDIVIDUAL': 'Индивидуальный предприниматель',
+            'NPD': 'Самозанятый (НПД)',
+            'FIZ': 'Физическое лицо'
+        }
+
+        type_desc = type_descriptions.get(inn_type, inn_type)
+
         if is_fallback:
-            logger.warning(f"Using fallback validation for INN {validated_inn[:4]}****")
             await event.message.answer(
-                "⚠️ Временно недоступна проверка по базе ФНС.\n"
-                "ИНН принят, но рекомендуем проверить его корректность."
+                f"⚠️ Проверка по базе ФНС временно недоступна.\n"
+                f"ИНН принят как: {type_desc}\n"
+                f"Продолжаем регистрацию..."
             )
         else:
-            # Показываем информацию о компании
-            company_info = f"✅ ИНН проверен: {company_data.get('name', {}).get('short', 'Неизвестно')}\n"
-            if company_data.get('address', {}).get('value'):
-                company_info += f"📍 {company_data['address']['value'][:100]}...\n"
-            company_info += f"📊 Статус: {'Действующая' if company_data.get('is_active') else company_data.get('state', {}).get('status', 'Неизвестно')}"
-            
-            await event.message.answer(company_info)
-        
+            company_info = f"✅ ИНН проверен\n"
+            company_info += f"📊 Тип: {type_desc}\n"
+
+            if inn_type == 'NPD' and validation_result.get('npd_message'):
+                company_info += f"✅ {validation_result['npd_message']}\n"
+
+            if inn_type == 'INDIVIDUAL' or inn_type == 'LEGAL':
+                if company_data.get('address', {}).get('value'):
+                    company_info += f"📍 {company_data['address']['value'][:100]}...\n"
+
+            # Проверяем статус только для юрлиц и ИП
+            if inn_type in ('LEGAL', 'INDIVIDUAL'):
+                if not validation_result.get('is_active', True):
+                    status = validation_result.get('state_status', 'неизвестно')
+                    await event.message.answer(
+                        f"{company_info}\n"
+                        f"⚠️ Внимание: статус компании - {status}\n"
+                        f"Регистрация продолжена, но рекомендуем проверить актуальность данных."
+                    )
+                else:
+                    await event.message.answer(company_info)
+            else:
+                # Для NPD и FIZ просто показываем информацию
+                await event.message.answer(company_info)
+
+        # Проверка дубликата в Bitrix24 (опционально)
         try:
-            # Проверяем дубликат в Bitrix24
             duplicate_in_bitrix = await bitrix_client.check_duplicate(
-                inn=validated_inn,
                 phone=user.get('phone', '')
             )
-            
+
             if duplicate_in_bitrix:
                 logger.warning(f"Duplicate found in Bitrix24 for user {user_id}")
+                # Не блокируем, но предупреждаем
                 await event.message.answer(
-                    "⚠️ Пользователь с таким ИНН или телефоном уже зарегистрирован в системе.\n"
-                    "Если это ошибка, свяжитесь с организаторами."
+                    "⚠️ Пользователь с таким телефоном уже зарегистрирован в системе.\n"
+                    "Регистрация продолжена."
                 )
-                return
-                
         except Exception as e:
             logger.error(f"Failed to check duplicate in Bitrix24: {e}")
-            
+
+        # Определяем имя организации и тип
         company_type, org_name = get_company_type_and_name(validation_result, company_data, user.get('name', user_name))
-        
+
+        # Отправляем данные в Bitrix24
         try:
-            # Отправляем данные в Bitrix24 с правильными полями
-            bitrix_id = await bitrix_client.send_registration({
-                'name': user.get('name', user_name),
-                'inn': validated_inn,
-                'phone': user.get('phone', ''),
-                'email': user.get('email', ''),
-                'company_name': org_name,
-                'company_type': company_type,
-                'is_individual': company_type == 'individual',
-            })
-            
+            # Нормализуем телефон перед отправкой
+            raw_phone = user.get('phone', '')
+            # Убираем все нецифровые символы и обеспечиваем формат 7XXXXXXXXXX
+            clean_phone = ''.join(filter(str.isdigit, raw_phone))
+            if len(clean_phone) == 11 and clean_phone.startswith('8'):
+                clean_phone = '7' + clean_phone[1:]
+            elif len(clean_phone) == 10:
+                clean_phone = '7' + clean_phone
+
+            # Создаем dadata_client для проверки НПД
+            async with DadataClient() as dadata_client:
+                bitrix_id = await bitrix_client.send_registration({
+                    'name': user.get('name', user_name),
+                    'inn': validated_inn,
+                    'phone': clean_phone,  # Нормализованный телефон
+                    'email': user.get('email', ''),
+                    'company_name': org_name,
+                    'company_type': company_type,
+                    'is_individual': company_type in ('individual', 'npd'),
+                }, dadata_client=dadata_client)  # ✅ Передаем dadata_client!
+
             if bitrix_id:
                 logger.info(f"Bitrix24 registration ID: {bitrix_id}")
             else:
                 logger.warning("Failed to get valid Bitrix24 ID")
-                
+
         except Exception as e:
             logger.error(f"Error sending to Bitrix24: {e}")
             bitrix_id = None
-        
-        # Если Bitrix24 не вернул ID, генерируем локальный
-        if not bitrix_id:
+
+        # Генерируем ID если Bitrix24 не вернул
+        if bitrix_id:
+            logger.info(f"✅ Using Bitrix24 ID: {bitrix_id}")
+        else:
             import hashlib
             raw = f"{user.get('phone')}_{validated_inn}"
             local_id = hashlib.md5(raw.encode()).hexdigest()[:8].upper()
             bitrix_id = f"DP-{local_id}"
-            logger.info(f"Using local ID: {bitrix_id}")
-        
+            logger.warning(f"⚠️ Bitrix24 didn't return ID, using local: {bitrix_id}")
+
+        # Сохраняем регистрацию локально
         try:
-            # Сохраняем регистрацию локально
             reg_id = await db.save_registration(
                 user_id=user_id,
                 chat_id=chat_id,
@@ -1401,19 +1466,20 @@ async def handle_all_messages(event: MessageCreated):
                 bitrix_id=bitrix_id
             )
             logger.info(f"Registration saved for user {user_id}, reg_id: {reg_id}")
-            
+
             # Сохраняем данные компании если доступны
             if not is_fallback and company_data:
                 await db.save_company_data(user_id, company_data)
-                
+
         except Exception as e:
             logger.error(f"Failed to save registration for user {user_id}: {e}")
             await event.message.answer("❌ Ошибка сохранения регистрации. Попробуйте позже.")
             return
-        
+
         if user_id in user_states:
             del user_states[user_id]
-        
+
+        # Генерируем и отправляем QR-код
         if bitrix_id:
             import qrcode
             import io
@@ -1446,8 +1512,8 @@ async def handle_all_messages(event: MessageCreated):
 
             await send_qr_image(event, img_bytes.getvalue(), bitrix_id, message_text)
             logger.info(f"QR code sent to user {user_id}")
-        
-        logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****, ID: {bitrix_id}")
+
+        logger.info(f"✓ User {user_id} successfully registered with INN: {validated_inn[:4]}****, type: {inn_type}, ID: {bitrix_id}")
         return
     
     
@@ -1499,22 +1565,27 @@ def get_company_type_and_name(validation_result: dict, company_data: dict, name:
     Returns:
         (company_type, org_name)
     """
-    raw_type = validation_result.get('type', '').upper()
-    is_fallback = validation_result.get('fallback', False)
+    inn_type = validation_result.get('type', 'FIZ').upper()
     
-    if is_fallback or not company_data:
-        # Fallback: просто ФИО
-        return 'individual', name
+    type_mapping = {
+        'LEGAL': 'organization',
+        'INDIVIDUAL': 'individual',
+        'NPD': 'npd',
+        'FIZ': 'individual'
+    }
     
-    # DaData возвращает: 'INDIVIDUAL' для ИП, 'LEGAL' для ООО/АО
-    if raw_type == 'INDIVIDUAL':
-        return 'individual', f"ИП {name}"
-    elif raw_type == 'LEGAL':
-        company_name = company_data.get('name', {}).get('short', name)
-        return 'organization', company_name
+    company_type = type_mapping.get(inn_type, 'individual')
+    
+    if inn_type == 'INDIVIDUAL':
+        org_name = f"ИП {name}"
+    elif inn_type == 'NPD':
+        org_name = f"Самозанятый {name}"
+    elif inn_type == 'LEGAL':
+        org_name = company_data.get('name', {}).get('short', name)
     else:
-        # Самозанятый или другой тип
-        return 'unknown', name
+        org_name = name
+    
+    return company_type, org_name
 
 
 async def get_qr_image_for_user(user_id: int, phone: str = None) -> Optional[tuple]:

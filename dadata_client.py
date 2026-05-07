@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import os
 import sys
 import httpx
+import time
 
 from config import AppConfig
 
@@ -108,12 +109,11 @@ def dadata_error_handler(func):
             logger.debug(f"  Args: {args}")
         if kwargs:
             # Фильтруем чувствительные данные
-            safe_kwargs = {k: (v[:4] + '****' if 'inn' in k.lower() else v) 
+            safe_kwargs = {k: (str(v)[:4] + '****' if hasattr(v, '__len__') and len(str(v)) > 4 and 'inn' in k.lower() else v) 
                           for k, v in kwargs.items()}
             logger.debug(f"  Kwargs: {safe_kwargs}")
         
         try:
-            import time
             start_time = time.time()
             
             result = await func(*args, **kwargs)
@@ -125,10 +125,10 @@ def dadata_error_handler(func):
             if result:
                 if isinstance(result, dict):
                     safe_result = {
-                        'inn': result.get('inn', '')[:4] + '****' if result.get('inn') else None,
+                        'inn': str(result.get('inn', ''))[:4] + '****' if result.get('inn') else None,
                         'type': result.get('type'),
                         'is_active': result.get('is_active'),
-                        'name': result.get('name', {}).get('short', 'Unknown')
+                        'name': result.get('name', {}).get('short', 'Unknown') if isinstance(result.get('name'), dict) else 'Unknown'
                     }
                     logger.debug(f"  Result summary: {safe_result}")
                 else:
@@ -201,7 +201,6 @@ class DadataClient:
     
     async def _make_request(self, endpoint: str, data: Dict[str, Any]) -> Optional[Dict]:
         """Выполнение запроса с отслеживанием времени"""
-        import time
         start_time = time.time()
         
         try:
@@ -368,9 +367,6 @@ class DadataClient:
     def cleanup_old_logs(days: int = 30):
         """Очистка старых лог-файлов"""
         try:
-            import time
-            from datetime import datetime, timedelta
-            
             cutoff_time = time.time() - (days * 24 * 60 * 60)
             
             for filename in os.listdir(log_dir):
@@ -414,6 +410,82 @@ class DadataClient:
             logger.error(f"Error getting log files info: {e}")
             return {'error': str(e)}
 
+    @dadata_error_handler
+    async def check_npd_status(self, inn: str) -> Optional[Dict[str, Any]]:
+        """Проверка статуса самозанятого через API ФНС (НПД)"""
+        logger.info(f"Checking NPD status for INN: {inn[:4]}****")
+        self.request_count += 1
+        
+        if not self.client:
+            raise RuntimeError("Client not initialized. Use 'async with' context manager.")
+        
+        from datetime import date
+        
+        try:
+            request_data = {
+                "inn": inn,
+                "requestDate": date.today().isoformat()
+            }
+            
+            response = await self.client.post(
+                "https://statusnpd.nalog.ru/api/v1/tracker/taxpayer_status",
+                json=request_data,
+                headers={
+                    "Content-Type": "application/json",
+                    # Убираем Authorization для этого запроса
+                }
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("status") is True:
+                logger.info(f"✅ INN {inn[:4]}**** is NPD taxpayer")
+                return {
+                    "is_npd": True,
+                    "message": data.get("message", ""),
+                    "type": "NPD"
+                }
+            else:
+                logger.info(f"❌ INN {inn[:4]}**** is NOT NPD taxpayer")
+                return {
+                    "is_npd": False,
+                    "message": data.get("message", ""),
+                    "type": None
+                }
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"NPD API HTTP error for INN {inn[:4]}****: {e.response.status_code}")
+            logger.error(f"  Response body: {e.response.text[:500]}")
+            return None
+        except Exception as e:
+            logger.error(f"NPD API error for INN {inn[:4]}****: {e}")
+            return None
+    
+    @staticmethod
+    def determine_registration_type(da_data_type: str, inn_length: int, is_npd: bool = False) -> str:
+        """
+        Определение типа регистрации для Bitrix24 на основе данных DaData
+        
+        Args:
+            da_data_type: Тип из DaData (LEGAL, INDIVIDUAL)
+            inn_length: Длина ИНН (10 для юрлиц, 12 для физлиц/ИП)
+            is_npd: Является ли самозанятым (НПД)
+        
+        Returns:
+            Тип для Bitrix24: "LEGAL", "INDIVIDUAL", "NPD", "FIZ"
+        """
+        if da_data_type == "LEGAL":
+            return "LEGAL"
+        elif da_data_type == "INDIVIDUAL":
+            return "INDIVIDUAL"
+        elif is_npd:
+            return "NPD"
+        elif inn_length == 12:
+            return "FIZ"  # Физическое лицо с ИНН
+        else:
+            return "FIZ"  # По умолчанию физлицо
+
 
 # Для тестирования
 async def test_dadata():
@@ -424,9 +496,9 @@ async def test_dadata():
     
     # Тестовые ИНН
     test_inns = [
-        "7707083893",  # Сбербанк
-        "7706107510",  # РЖД
+        "7707083893",  # Сбербанк (юрлицо)
         "500100732259",  # ИП (пример)
+        "123456789012",  # Физлицо (пример)
     ]
     
     async with DadataClient() as client:
@@ -436,9 +508,18 @@ async def test_dadata():
                 company = await client.find_company_by_inn(inn)
                 if company:
                     print(f"  ✅ Found: {company['name']['short']}")
-                    print(f"     Type: {company['type']}")
+                    print(f"     DaData Type: {company['type']}")
+                    
+                    # Определяем тип для Bitrix24
+                    reg_type = client.determine_registration_type(
+                        da_data_type=company['type'],
+                        inn_length=len(inn),
+                        is_npd=False  # Для теста
+                    )
+                    print(f"     Bitrix24 Type: {reg_type}")
                     print(f"     Status: {company['state']['status']}")
                     print(f"     Active: {company['is_active']}")
+                    
                     if company.get('address', {}).get('value'):
                         addr = company['address']['value']
                         print(f"     Address: {addr[:50]}..." if len(addr) > 50 else f"     Address: {addr}")
@@ -461,9 +542,6 @@ async def test_dadata():
             print(f"  Total size: {log_info['total_size_mb']} MB")
             for log_file in log_info['files']:
                 print(f"    - {log_file['name']}: {log_file['size_mb']} MB (modified: {log_file['modified']})")
-        
-        # Очистка старых логов (опционально)
-        # client.cleanup_old_logs(days=30)
 
 
 if __name__ == '__main__':
