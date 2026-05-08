@@ -1131,46 +1131,17 @@ async def handle_all_messages(event: MessageCreated):
     # Обработка состояния ожидания телефона
     if state == 'awaiting_phone':
         logger.info(f"Processing phone input for user {user_id}")
-
+    
         # Пытаемся извлечь телефон ТОЛЬКО из контакта (кнопка "Поделиться")
         phone = extract_phone_from_message(event.message)
-
+    
         # Если телефон получен через кнопку - обрабатываем
         if phone:
             logger.info(f"Phone from contact button: {phone[:4]}****")
-
-            # Проверяем, не зарегистрирован ли уже пользователь по phone
-            clean_phone = re.sub(r'[^\d]', '', phone)
-            existing_registration = await db.get_registration_by_phone(clean_phone)
-
-            if existing_registration:
-                logger.info(f"User already registered with this phone, sending QR code")
-
-                qr_result = await get_qr_image_for_user(
-                    existing_registration['user_id'], 
-                    phone
-                )
-
-                if qr_result:
-                    qr_bytes, bitrix_id = qr_result
-                    message_text = (
-                        "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
-                        "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
-                        "Покажите данный QR–код при посещении мероприятий."
-                    )
-                    await send_qr_image(event, qr_bytes, bitrix_id, message_text)
-                else:
-                    await event.message.answer(
-                        "Вы успешно зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
-                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
-                        "программа форума и регистрация на сайте дни-предпринимательства.рф"
-                    )
-                return
-
-            # Валидируем телефон
+    
+            # Валидируем телефон сначала
             validated = validate_phone(phone)
-
+    
             if not validated:
                 logger.warning(f"Invalid phone format for user {user_id}")
                 keyboard = create_phone_keyboard()
@@ -1180,30 +1151,136 @@ async def handle_all_messages(event: MessageCreated):
                     attachments=[keyboard]
                 )
                 return
+    
+            # Нормализуем телефон для проверок
+            normalized_phone = BitrixClient.normalize_phone(validated.number)
+    
+            # Проверка 1: Ищем в локальной базе данных бота
+            existing_registration = await db.get_registration_by_phone(normalized_phone)
+    
+            if existing_registration:
+                logger.info(f"User already registered in local DB with this phone, sending QR code")
+    
+                qr_result = await get_qr_image_for_user(
+                    existing_registration['user_id'], 
+                    normalized_phone
+                )
+    
+                if qr_result:
+                    qr_bytes, bitrix_id = qr_result
+                    message_text = (
+                        "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                        "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                        "Покажите данный QR–код при посещении мероприятий."
+                    )
+                    await send_qr_image(event, qr_bytes, bitrix_id, message_text)
+                else:
+                    await event.message.answer(
+                        "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                        "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                        "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                        "Если вам нужен QR-код, обратитесь к организаторам."
+                    )
+                return
+    
+            # Проверка 2: Ищем в Bitrix24 по номеру телефона
+            logger.info(f"Checking duplicate in Bitrix24 for phone: {normalized_phone[:4]}****")
+            try:
+                duplicate_in_bitrix = await bitrix_client.check_duplicate_by_phone(normalized_phone)
 
-            # Сохраняем телефон
+                if duplicate_in_bitrix:
+                    logger.warning(f"Phone {normalized_phone[:4]}**** already registered in Bitrix24")
+
+                    # Ищем регистрацию в Bitrix24 чтобы получить данные
+                    bitrix_registration = await bitrix_client.find_registration_by_phone(normalized_phone)
+
+                    if bitrix_registration:
+                        # ✅ Используем Leadid вместо id
+                        lead_id = bitrix_registration.get('Leadid')  # Основной ID лида
+                        bitrix_id = bitrix_registration.get('id')     # ID записи
+                        bitrix_inn = bitrix_registration.get('Inn', bitrix_registration.get('inn', ''))
+
+                        logger.info(f"Found registration in Bitrix24: Leadid={lead_id}, id={bitrix_id}, INN={bitrix_inn[:4] if bitrix_inn else 'N/A'}****")
+
+                        # Сохраняем регистрацию локально если её нет
+                        try:
+                            local_reg = await db.get_registration_by_phone(normalized_phone)
+                            if not local_reg:
+                                await db.save_registration(
+                                    user_id=user_id,
+                                    chat_id=chat_id,
+                                    name=user_name,
+                                    phone=normalized_phone,
+                                    email='',
+                                    inn=bitrix_inn,
+                                    event_name=config.bot.event_name,
+                                    bitrix_id=lead_id  
+                                )
+                                logger.info(f"Saved Bitrix24 registration locally for user {user_id}, Leadid={lead_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to save Bitrix24 registration locally: {e}")
+
+                        # Генерируем QR-код с Leadid
+                        if lead_id:
+                            qr_result = await get_qr_image_for_user(user_id, normalized_phone)
+
+                            if qr_result:
+                                qr_bytes, qr_id = qr_result
+                                message_text = (
+                                    "Вы уже зарегистрированы на форум «Мой бизнес: ДНИ ПРЕДПРИНИМАТЕЛЬСТВА»\n\n"
+                                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                                    "программа форума и регистрация на сайте дни-предпринимательства.рф\n\n"
+                                    "Покажите данный QR–код при посещении мероприятий."
+                                )
+                                await send_qr_image(event, qr_bytes, qr_id, message_text)
+                            else:
+                                await event.message.answer(
+                                    "⚠️ Вы уже зарегистрированы в системе.\n\n"
+                                    "Ответим на ваши вопросы по телефону 8-800-234-01-24, "
+                                    "программа форума и регистрация на сайте дни-предпринимательства.рф"
+                                )
+                        else:
+                            await event.message.answer(
+                                "⚠️ Вы уже зарегистрированы в системе.\n\n"
+                                "Если вам нужен QR-код, обратитесь к организаторам."
+                            )
+                    else:
+                        await event.message.answer(
+                            "⚠️ Этот номер телефона уже зарегистрирован в системе.\n\n"
+                            "Если вы забыли QR-код, обратитесь к организаторам."
+                        )
+                    return
+
+            except Exception as e:
+                logger.error(f"Error checking duplicate in Bitrix24: {e}")
+                # Продолжаем регистрацию даже при ошибке проверки
+    
+            # Если дошли сюда - телефон не найден нигде, продолжаем регистрацию
+            
+            # Сохраняем телефон в локальной БД
             try:
                 await db.save_user(
                     user_id=user_id,
-                    phone=validated.number,
+                    phone=normalized_phone,  # Сохраняем нормализованный номер
                     state='awaiting_email',
                     status='pending'
                 )
-                logger.info(f"Phone saved for user {user_id}")
+                logger.info(f"Phone saved for user {user_id}: {normalized_phone}")
             except Exception as e:
                 logger.error(f"Failed to save phone for user {user_id}: {e}")
                 await event.message.answer("❌ Ошибка сохранения данных. Попробуйте позже.")
                 return
-
+    
             user_states[user_id] = 'awaiting_email'
             logger.info(f"User {user_id} state changed to 'awaiting_email'")
-
+    
             await event.message.answer(
                 "📧 Отлично! Теперь отправьте ваш Email адрес:\n"
                 "Например: example@mail.ru"
             )
             return
-
+    
         # Если телефон не получен (пользователь отправил текст вместо контакта)
         else:
             logger.warning(f"User {user_id} sent text instead of contact")

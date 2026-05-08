@@ -3,7 +3,7 @@ import httpx
 import logging
 import re
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class BitrixClient:
             timeout: Таймаут запроса в секундах
         """
         self.register_url = register_url or "https://bitrix.neto.ru/bot_dp_register.php"
-        self.list_url = list_url or "https://bitrix.neto.ru/bot_dp_register_list.php"
+        self.list_url = list_url or "https://bitrix.neto.ru/.bot_dp_register_list.php"
         self.timeout = timeout
         logger.info(f"BitrixClient initialized")
         logger.info(f"  Register URL: {self.register_url}")
@@ -30,7 +30,22 @@ class BitrixClient:
     @staticmethod
     def normalize_phone(phone: str) -> str:
         """
-        Нормализация телефона в формат 7XXXXXXXXXX (11 цифр)
+        Нормализация телефона для сравнения
+        Приводит к формату: 79676030166 (11 цифр, начиная с 7)
+        
+        Args:
+            phone: Номер телефона в любом формате
+        
+        Returns:
+            Нормализованный номер (только цифры)
+        
+        Examples:
+            >>> BitrixClient.normalize_phone("+7 (967) 603-01-66")
+            '79676030166'
+            >>> BitrixClient.normalize_phone("89676030166")
+            '79676030166'
+            >>> BitrixClient.normalize_phone("79676030166")
+            '79676030166'
         """
         if not phone:
             return ""
@@ -38,15 +53,13 @@ class BitrixClient:
         # Удаляем все нецифровые символы
         digits = ''.join(filter(str.isdigit, phone))
         
+        # Приводим к формату 7XXXXXXXXXX
         if len(digits) == 11 and digits.startswith('8'):
             return '7' + digits[1:]
-        elif len(digits) == 11 and digits.startswith('7'):
-            return digits
         elif len(digits) == 10:
             return '7' + digits
-        else:
-            return digits
-        
+        return digits
+    
     async def send_registration(self, user_data: Dict[str, Any], dadata_client=None) -> Optional[str]:
         """
         Отправка данных регистрации на сервер Bitrix24
@@ -71,11 +84,15 @@ class BitrixClient:
         try:
             name = user_data.get('name', '')
             inn = user_data.get('inn', '')
-            phone_formatted = user_data.get('phone', '')
+            raw_phone = user_data.get('phone', '')
             email = user_data.get('email', '')
             company_type = user_data.get('company_type', '')
             company_name = user_data.get('company_name', '')
             is_individual = user_data.get('is_individual', False)
+            
+            # Нормализуем телефон
+            phone_formatted = self.normalize_phone(raw_phone)
+            logger.info(f"Phone normalized: '{raw_phone}' → '{phone_formatted}'")
             
             # Определяем тип регистрации
             registration_type = await self._determine_registration_type(
@@ -87,16 +104,12 @@ class BitrixClient:
             
             # Формируем поле Org в зависимости от типа
             if registration_type == "INDIVIDUAL":
-                # ИП - пишем "ИП ФИО"
                 org = f"ИП {name}" if name else "ИП"
             elif registration_type == "LEGAL":
-                # Организация - пишем название компании
                 org = company_name if company_name else "Организация"
             elif registration_type == "NPD":
-                # Самозанятый - просто ФИО
                 org = name if name else "Самозанятый"
             else:
-                # Физическое лицо - просто ФИО
                 org = name if name else "Физическое лицо"
             
             # Формируем JSON payload с правильным типом
@@ -162,19 +175,15 @@ class BitrixClient:
         logger.info(f"Determining registration type for INN: {inn[:4]}****")
         logger.info(f"  company_type: {company_type}, is_individual: {is_individual}")
         
-        # Если это организация (юридическое лицо)
         if company_type == 'organization':
             logger.info("  → Type: LEGAL (organization)")
             return "LEGAL"
         
-        # Если это ИП (индивидуальный предприниматель)
         if company_type == 'individual':
             logger.info("  → Type: INDIVIDUAL (individual entrepreneur)")
             return "INDIVIDUAL"
         
-        # Если это физическое лицо или неопределенный тип
         if is_individual or company_type == '' or company_type is None:
-            # Проверяем, является ли самозанятым через API ФНС
             if dadata_client and inn:
                 try:
                     logger.info(f"  Checking NPD status via DaData client...")
@@ -183,88 +192,89 @@ class BitrixClient:
                     if npd_status and npd_status.get("is_npd"):
                         logger.info(f"  → Type: NPD (self-employed confirmed by FNS)")
                         return "NPD"
-                    else:
-                        logger.info(f"  → Not NPD, checking INN length...")
                 except Exception as e:
-                    logger.error(f"  Error checking NPD status: {e}, falling back to INN length check")
+                    logger.error(f"  Error checking NPD status: {e}")
             
-            # Если не удалось проверить через API или нет dadata_client
-            # Определяем по длине ИНН
             if inn and len(inn) == 12:
-                # ИНН из 12 цифр может быть у физлица или ИП
-                # Если нет данных из DaData, пробуем определить по другим признакам
                 logger.info(f"  → Type: FIZ (individual with 12-digit INN)")
                 return "FIZ"
             elif inn and len(inn) == 10:
-                # ИНН из 10 цифр - это юрлицо
                 logger.info(f"  → Type: LEGAL (10-digit INN)")
                 return "LEGAL"
             else:
-                # По умолчанию - физическое лицо
                 logger.info(f"  → Type: FIZ (default)")
                 return "FIZ"
         
-        # По умолчанию
         logger.info(f"  → Type: FIZ (fallback)")
         return "FIZ"
     
     def _extract_id_from_response(self, response_text: str) -> Optional[str]:
         """
         Извлечение ID из ответа сервера
-        
-        Args:
-            response_text: Текст ответа от сервера
-            
-        Returns:
-            ID регистрации или None
+        Сервер возвращает: $resultJson='{"id": "97854"}'
+        Или просто: {"Leadid":"98835","id":"197",...}
         """
         logger.debug(f"Extracting ID from response: {response_text[:200]}")
-        
-        # Учитываем, что сервер возвращает $resultJson='{"id": "97854"}';
-        json_patterns = [
-            r'\{\s*"id"\s*:\s*"(\d+)"\s*\}',  # { "id" : "97854" }
-            r'\{\s*"id"\s*:\s*(\d+)\s*\}',      # { "id" : 97854 }
-            r'"id"\s*:\s*"(\d+)"',              # "id" : "97854"
-            r'"id"\s*:\s*(\d+)',                # "id" : 97854
-            r'id["\']?\s*[=:]\s*["\']?(\d+)',   # id: 97854 или id="97854"
+
+        # Сначала ищем Leadid (основной ID лида в Bitrix24)
+        lead_id_patterns = [
+            r'"Leadid"\s*:\s*"(\d+)"',     # "Leadid" : "98835"
+            r'"Leadid"\s*:\s*(\d+)',        # "Leadid" : 98835
         ]
-        
+
+        for pattern in lead_id_patterns:
+            match = re.search(pattern, response_text)
+            if match:
+                lead_id = match.group(1)
+                logger.info(f"Found Leadid using pattern: {lead_id}")
+                return lead_id
+
+        # Если Leadid не найден, ищем обычный id
+        json_patterns = [
+            r'\{\s*"id"\s*:\s*"(\d+)"\s*\}',
+            r'\{\s*"id"\s*:\s*(\d+)\s*\}',
+            r'"id"\s*:\s*"(\d+)"',
+            r'"id"\s*:\s*(\d+)',
+            r'id["\']?\s*[=:]\s*["\']?(\d+)',
+        ]
+
         for pattern in json_patterns:
             match = re.search(pattern, response_text)
             if match:
                 reg_id = match.group(1)
-                logger.info(f"Found ID using pattern '{pattern}': {reg_id}")
+                logger.info(f"Found id (fallback): {reg_id}")
                 return reg_id
-        
-        # Пробуем найти JSON в ответе и распарсить его
+
+        # Пробуем распарсить JSON
         try:
             json_match = re.search(r'\{[^}]+\}', response_text)
             if json_match:
-                json_str = json_match.group()
-                result = json.loads(json_str)
-                if isinstance(result, dict) and 'id' in result:
-                    reg_id = str(result['id'])
-                    logger.info(f"Found ID from JSON: {reg_id}")
-                    return reg_id
+                result = json.loads(json_match.group())
+                if isinstance(result, dict):
+                    # Приоритет: Leadid > id
+                    if 'Leadid' in result:
+                        return str(result['Leadid'])
+                    elif 'id' in result:
+                        return str(result['id'])
         except json.JSONDecodeError:
             pass
         
-        # Пробуем распарсить весь ответ как JSON
         try:
             result = json.loads(response_text)
-            if isinstance(result, dict) and 'id' in result:
-                reg_id = str(result['id'])
-                logger.info(f"Found ID from full JSON: {reg_id}")
-                return reg_id
+            if isinstance(result, dict):
+                if 'Leadid' in result:
+                    return str(result['Leadid'])
+                elif 'id' in result:
+                    return str(result['id'])
         except json.JSONDecodeError:
             pass
         
-        logger.warning(f"Could not extract ID from response")
+        logger.warning("Could not extract ID from response")
         return None
     
-    async def get_registration_list(self) -> Optional[list]:
+    async def get_registration_list(self) -> Optional[List[Dict[str, Any]]]:
         """
-        Получение списка регистраций с сервера Bitrix24
+        Получение списка ВСЕХ регистраций с сервера Bitrix24
         
         Returns:
             Список регистраций или None в случае ошибки
@@ -276,11 +286,28 @@ class BitrixClient:
                 response = await client.get(self.list_url)
                 response.raise_for_status()
                 
-                result = response.json()
+                response_text = response.text.strip()
+                logger.debug(f"Raw response: {response_text[:500]}")
+                
+                # Пробуем распарсить ответ
+                try:
+                    result = response.json()
+                except json.JSONDecodeError:
+                    # Может быть JSON в JSONP или другой обертке
+                    json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+                    else:
+                        logger.error(f"Cannot parse response: {response_text[:200]}")
+                        return None
                 
                 if isinstance(result, list):
                     logger.info(f"✅ Got {len(result)} registrations from Bitrix24")
                     return result
+                elif isinstance(result, dict):
+                    # Если вернулся один объект, а не массив
+                    logger.info(f"✅ Got single registration from Bitrix24")
+                    return [result]
                 else:
                     logger.error(f"Unexpected response format: {type(result)}")
                     return None
@@ -292,18 +319,73 @@ class BitrixClient:
             logger.error(f"Error getting list from Bitrix24: {e}")
             return None
     
-    async def check_duplicate(self, inn: str, phone: str) -> bool:
+    async def find_registration_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
         """
-        Проверка на дубликат регистрации по ИНН и телефону
+        Поиск регистрации по номеру телефона в Bitrix24
+        
+        Returns:
+            Данные регистрации с полями: id, Leadid, Inn, Phone
+        """
+        logger.info(f"Searching registration in Bitrix24 by phone: {phone[:4]}****")
+        
+        search_phone = self.normalize_phone(phone)
+        
+        if not search_phone:
+            return None
+        
+        try:
+            registrations = await self.get_registration_list()
+            
+            if not registrations:
+                return None
+            
+            for reg in registrations:
+                reg_phone = reg.get('Phone', reg.get('phone', ''))
+                normalized_reg_phone = self.normalize_phone(reg_phone)
+                
+                if normalized_reg_phone == search_phone:
+                    logger.info(f"✅ Found: Leadid={reg.get('Leadid')}, id={reg.get('id')}, Phone={reg_phone}")
+                    return reg
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error searching registration by phone: {e}")
+            return None
+    
+    async def check_duplicate_by_phone(self, phone: str) -> bool:
+        """
+        Проверка наличия регистрации по телефону в Bitrix24
         
         Args:
-            inn: ИНН для проверки
-            phone: Телефон для проверки
+            phone: Номер телефона для проверки
+        
+        Returns:
+            True если регистрация найдена
+        """
+        logger.info(f"Checking duplicate in Bitrix24 by phone: {phone[:4]}****")
+        
+        registration = await self.find_registration_by_phone(phone)
+        
+        if registration:
+            logger.warning(f"⚠️ Duplicate found in Bitrix24! Phone: {phone[:4]}****, ID: {registration.get('id')}")
+            return True
+        
+        logger.info(f"✅ No duplicate found in Bitrix24 for phone: {phone[:4]}****")
+        return False
+    
+    async def check_duplicate(self, inn: str = None, phone: str = None) -> bool:
+        """
+        Проверка на дубликат регистрации по ИНН и/или телефону
+        
+        Args:
+            inn: ИНН для проверки (опционально)
+            phone: Телефон для проверки (опционально)
             
         Returns:
             True если дубликат найден
         """
-        logger.info(f"Checking duplicate for INN: {inn[:4]}****")
+        logger.info(f"Checking duplicate in Bitrix24 - INN: {inn[:4] if inn else 'N/A'}****, Phone: {phone[:4] if phone else 'N/A'}****")
         
         try:
             registrations = await self.get_registration_list()
@@ -312,57 +394,64 @@ class BitrixClient:
                 logger.warning("Could not get registration list, skipping duplicate check")
                 return False
             
+            # Нормализуем телефон для сравнения
+            normalized_phone = self.normalize_phone(phone) if phone else ""
+            
             for reg in registrations:
-                reg_inn = reg.get('inn', reg.get('INN', ''))
-                reg_phone = reg.get('phone', reg.get('Phone', reg.get('PHONE', '')))
+                reg_inn = reg.get('Inn', reg.get('inn', reg.get('INN', '')))
+                reg_phone = self.normalize_phone(
+                    reg.get('Phone', reg.get('phone', reg.get('PHONE', '')))
+                )
                 
-                clean_phone = ''.join(filter(str.isdigit, phone))
-                clean_reg_phone = ''.join(filter(str.isdigit, reg_phone))
+                # Проверка по ИНН
+                if inn and reg_inn == inn:
+                    logger.warning(f"Duplicate found by INN: {inn[:4]}****")
+                    return True
                 
-                if reg_inn == inn or (clean_phone and clean_reg_phone and clean_phone == clean_reg_phone):
-                    logger.warning(f"Duplicate found! INN: {inn[:4]}****")
+                # Проверка по телефону
+                if normalized_phone and reg_phone and normalized_phone == reg_phone:
+                    logger.warning(f"Duplicate found by Phone: {phone[:4]}****")
                     return True
             
-            logger.info("No duplicate found")
+            logger.info("No duplicate found in Bitrix24")
             return False
             
         except Exception as e:
-            logger.error(f"Error checking duplicate: {e}")
+            logger.error(f"Error checking duplicate in Bitrix24: {e}")
             return False
 
 
-# Пример использования с DaData клиентом
-async def example_with_npd_check():
-    """Пример отправки регистрации с проверкой НПД статуса"""
-    from dadata_client import DadataClient
+# Пример использования
+async def test_bitrix_check():
+    """Тест проверки дубликатов в Bitrix24"""
+    print("\n" + "=" * 50)
+    print("🧪 Testing Bitrix24 Duplicate Check")
+    print("=" * 50 + "\n")
     
-    # Создаем клиенты
-    bitrix_client = BitrixClient()
+    client = BitrixClient()
     
-    # Данные пользователя (пример для самозанятого)
-    user_data = {
-        "name": "ТЕСТОВОЕ ИМЯ ФАМИЛИЯ",
-        "inn": "246417869701",
-        "phone": "79676030166",
-        "email": "960866@xmail.ru",
-        "company_name": "",
-        "company_type": "",
-        "is_individual": True
-    }
+    # Тест 1: Проверка по телефону
+    test_phone = "+7 (967) 603-01-66"
+    print(f"📱 Checking phone: {test_phone}")
+    duplicate = await client.check_duplicate_by_phone(test_phone)
+    print(f"  Result: {'❌ Duplicate found!' if duplicate else '✅ No duplicate'}\n")
     
-    # Используем DaData клиент для проверки НПД
-    async with DadataClient() as dadata_client:
-        result = await bitrix_client.send_registration(
-            user_data=user_data,
-            dadata_client=dadata_client
-        )
-        
-        if result:
-            print(f"✅ Registration successful! ID: {result}")
-        else:
-            print("❌ Registration failed!")
+    # Тест 2: Проверка по ИНН и телефону
+    test_inn = "246417869701"
+    test_phone2 = "79676030166"
+    print(f"📋 Checking INN: {test_inn[:4]}**** and Phone: {test_phone2[:4]}****")
+    duplicate = await client.check_duplicate(inn=test_inn, phone=test_phone2)
+    print(f"  Result: {'❌ Duplicate found!' if duplicate else '✅ No duplicate'}\n")
+    
+    # Тест 3: Поиск регистрации по телефону
+    print(f"🔍 Searching registration by phone: {test_phone}")
+    reg = await client.find_registration_by_phone(test_phone)
+    if reg:
+        print(f"  ✅ Found: ID={reg.get('id')}, INN={reg.get('Inn', '')[:4]}****, Phone={reg.get('Phone')}")
+    else:
+        print(f"  ❌ Not found\n")
 
 
 if __name__ == '__main__':
     import asyncio
-    asyncio.run(example_with_npd_check())
+    asyncio.run(test_bitrix_check())

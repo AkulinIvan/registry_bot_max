@@ -127,4 +127,4 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dadata: DadataConfig = field(default_factory=DadataConfig)
     bitrix: BitrixConfig = field(default_factory=BitrixConfig)
-    admin: AdminConfig = field(default_factory=AdminConfig)  # ← добавить
+    admin: AdminConfig = field(default_factory=AdminConfig)
