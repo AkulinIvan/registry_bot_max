@@ -10,6 +10,7 @@ from functools import wraps
 from logging.handlers import RotatingFileHandler
 import os
 
+import httpx
 from maxapi import Bot, Dispatcher
 from maxapi.types import MessageCreated, Command
 from maxapi.types.updates import BotAdded, BotStarted, DialogRemoved, MessageCallback
@@ -22,7 +23,7 @@ from dadata_client import DadataClient
 from database import Database
 from bitrix_client import BitrixClient
 from admin_service import AdminService, format_broadcast_result
-
+from checking_service import checkin_service, CheckInResult
 
 logger = logging.getLogger(__name__)
 import maxapi.types.attachments as attachments_module
@@ -334,6 +335,53 @@ def get_user_name(event: MessageCreated) -> str:
         logger.error(f"Failed to get user_name: {e}")
         return "Пользователь"
 
+async def send_callback_response(event, text: str, attachments=None):
+    """
+    Универсальная отправка ответа на callback в MAX API
+    
+    Args:
+        event: объект MessageCallback
+        text: текст сообщения
+        attachments: список вложений (клавиатура и т.д.)
+    """
+    try:
+        # Получаем chat_id из callback
+        chat_id = get_chat_id(event)
+        
+        if chat_id:
+            # Отправляем новое сообщение в чат
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                attachments=attachments or []
+            )
+            logger.info(f"Sent callback response to chat {chat_id}")
+            return True
+        else:
+            # Если chat_id не найден, просто подтверждаем callback
+            logger.warning("No chat_id found in callback")
+            try:
+                await event.answer(show_alert=False)
+            except:
+                pass
+            return False
+            
+    except MaxApiError as e:
+        if "chat.not.found" in str(e) or "Unknown recipient" in str(e):
+            logger.warning(f"Chat not available: {e}")
+            try:
+                await event.answer(show_alert=False)
+            except:
+                pass
+            return False
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send callback response: {e}")
+        try:
+            await event.answer(show_alert=False)
+        except:
+            pass
+        return False
 
 def get_chat_id(event: MessageCreated) -> Optional[int]:
     """Получение chat_id из события"""
@@ -518,6 +566,7 @@ async def admin_command(event: MessageCreated):
     builder.row(CallbackButton(text="📊 Статистика", callback_data="admin_stats", payload="admin_stats"))
     builder.row(CallbackButton(text="📨 Рассылка", callback_data="admin_broadcast", payload="admin_broadcast"))
     builder.row(CallbackButton(text="📈 История рассылок", callback_data="admin_history", payload="admin_history"))
+    builder.row(CallbackButton(text="📋 Отметка участников", callback_data="admin_checkin", payload="admin_checkin"))
     builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
     
     await event.message.answer(
@@ -526,6 +575,31 @@ async def admin_command(event: MessageCreated):
         attachments=[builder.as_markup()]
     )
 
+@dp.message_created(Command('checkin'))
+@safe_execute
+async def checkin_command(event: MessageCreated):
+    """Команда для отметки участников"""
+    user_id = get_user_id(event)
+    
+    if not admin_service.is_admin(user_id):
+        logger.warning(f"Unauthorized checkin access from user {user_id}")
+        await event.message.answer("⛔ У вас нет доступа к отметке участников.")
+        return
+    
+    # Загружаем список мероприятий
+    await event.message.answer("🔄 Загружаю список мероприятий...")
+    events = await checkin_service.fetch_events()
+    
+    if not events:
+        await event.message.answer("❌ Не удалось загрузить мероприятия.")
+        return
+    
+    keyboard = checkin_service.get_events_keyboard()
+    await event.message.answer(
+        f"📅 Доступные мероприятия ({len(events)}):\n\n"
+        "Выберите мероприятие для отметки участников:",
+        attachments=[keyboard]
+    )
 
 @dp.message_created(Command('stats'))
 @safe_execute
@@ -912,6 +986,385 @@ async def handle_callback(event: MessageCallback):
             if f"{user_id}_broadcast_text" in user_states:
                 del user_states[f"{user_id}_broadcast_text"]
 
+    
+    # Показ меню отметки участников
+    elif callback_data == "admin_checkin":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+
+        user_states[user_id] = 'admin_checkin_menu'
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(
+            text="📋 Выбрать мероприятие",
+            callback_data="checkin_select_event",
+            payload="checkin_select_event"
+        ))
+        builder.row(CallbackButton(
+            text="📷 Сканировать QR-код",
+            callback_data="checkin_scan_qr",
+            payload="checkin_scan_qr"
+        ))
+        builder.row(CallbackButton(
+            text="✏️ Ввести ID участника",
+            callback_data="checkin_manual_id",
+            payload="checkin_manual_id"
+        ))
+
+        if checkin_service.current_event_id:
+            builder.row(CallbackButton(
+                text="📊 Текущее мероприятие",
+                callback_data="checkin_current_event",
+                payload="checkin_current_event"
+            ))
+
+        builder.row(CallbackButton(
+            text="◀️ Назад в админ-панель",
+            callback_data="admin_back",
+            payload="admin_back"
+        ))
+
+        info = checkin_service.get_current_event_info()
+        await event.message.answer(
+            f"📋 Отметка участников\n\n{info}Выберите действие:",
+            attachments=[builder.as_markup()]
+        )
+
+    # Выбор мероприятия из списка
+    elif callback_data == "checkin_select_event":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+
+        # Загружаем список мероприятий
+        await event.message.answer("🔄 Загружаю список мероприятий...")
+
+        events = await checkin_service.fetch_events()
+
+        if not events:
+            await event.message.answer(
+                "❌ Не удалось загрузить список мероприятий.\n"
+                "Проверьте подключение к API.",
+                attachments=[InlineKeyboardBuilder().row(
+                    CallbackButton(text="🔄 Попробовать снова", callback_data="checkin_select_event", payload="checkin_select_event")
+                ).row(
+                    CallbackButton(text="◀️ Назад", callback_data="admin_checkin", payload="admin_checkin")
+                ).as_markup()]
+            )
+            return
+
+        user_states[user_id] = 'admin_checkin_select_event'
+
+        keyboard = checkin_service.get_events_keyboard(page=0, per_page=8)
+        await event.message.answer(
+            f"📅 Доступные мероприятия ({len(events)}):\n\n"
+            "Выберите мероприятие для отметки участников:",
+            attachments=[keyboard]
+        )
+
+    elif callback_data.startswith("events_page_"):
+        if not admin_service.is_admin(user_id):
+            return
+
+        page_str = callback_data.replace("events_page_", "")
+
+        if page_str == "current":
+            # Просто показываем текущую страницу (заглушка)
+            await event.answer()
+            return
+
+        try:
+            page = int(page_str)
+        except ValueError:
+            return
+
+        if not checkin_service.events:
+            await event.message.answer("❌ Список мероприятий пуст. Нажмите 'Обновить список'.")
+            return
+
+        keyboard = checkin_service.get_events_keyboard(page=page, per_page=8)
+        total_events = len(checkin_service.events)
+
+        await event.message.answer(
+            f"📅 Доступные мероприятия ({total_events}):\n\n"
+            f"Страница {page + 1}. Выберите мероприятие:",
+            attachments=[keyboard]
+        )
+    
+    # Обновление списка мероприятий
+    elif callback_data == "refresh_events":
+        if not admin_service.is_admin(user_id):
+            return
+
+        events = await checkin_service.fetch_events()
+
+        if events:
+            keyboard = checkin_service.get_events_keyboard()
+            await event.message.answer(
+                f"✅ Список обновлен! Найдено мероприятий: {len(events)}\n\n"
+                "Выберите мероприятие:",
+                attachments=[keyboard]
+            )
+        else:
+            await event.message.answer(
+                "❌ Не удалось обновить список мероприятий."
+            )
+
+    # Выбор конкретного мероприятия
+    elif callback_data.startswith("select_event_"):
+        if not admin_service.is_admin(user_id):
+            return
+
+        event_id = callback_data.replace("select_event_", "")
+
+        if checkin_service.select_event(event_id):
+            event_obj = checkin_service.events.get(event_id)
+
+            # Возвращаемся в меню отметки
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(
+                text="📷 Сканировать QR-код",
+                callback_data="checkin_scan_qr",
+                payload="checkin_scan_qr"
+            ))
+            builder.row(CallbackButton(
+                text="✏️ Ввести ID участника",
+                callback_data="checkin_manual_id",
+                payload="checkin_manual_id"
+            ))
+            builder.row(CallbackButton(
+                text="📅 Выбрать другое мероприятие",
+                callback_data="checkin_select_event",
+                payload="checkin_select_event"
+            ))
+            builder.row(CallbackButton(
+                text="◀️ Назад",
+                callback_data="admin_checkin",
+                payload="admin_checkin"
+            ))
+
+            date_info = f"\n📅 Дата: {event_obj.date}" if event_obj.date else ""
+            location_info = f"\n📍 Место: {event_obj.location}" if event_obj.location else ""
+
+            # Получаем chat_id из колбэка
+            chat_id = getattr(event.callback, 'chat_id', None) or get_chat_id(event)
+
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ Мероприятие выбрано:\n\n"
+                        f"📋 {event_obj.name}\n"
+                        f"🆔 ID: {event_obj.id}"
+                        f"{date_info}"
+                        f"{location_info}\n\n"
+                        "Теперь вы можете отмечать участников:"
+                    ),
+                    attachments=[builder.as_markup()]
+                )
+            except Exception as e:
+                logger.error(f"Failed to send message: {e}")
+                # Запасной вариант
+                await event.answer(
+                    text=f"✅ Выбрано: {event_obj.name}",
+                    show_alert=False
+                )
+        else:
+            await event.answer(
+                text="❌ Мероприятие не найдено.",
+                show_alert=True
+            )
+
+    # Информация о текущем мероприятии
+    elif callback_data == "checkin_current_event":
+        if not admin_service.is_admin(user_id):
+            return
+
+        info = checkin_service.get_current_event_info()
+        await event.message.answer(
+            f"📊 Информация о мероприятии:\n\n{info}"
+        )
+
+    # Сканирование QR-кода (ожидаем фото)
+    elif callback_data == "checkin_scan_qr":
+        if not admin_service.is_admin(user_id):
+            return  
+
+        if not checkin_service.current_event_id:
+            await send_callback_response(
+                event,
+                "❌ Сначала выберите мероприятие!",
+                [InlineKeyboardBuilder().row(
+                    CallbackButton(text="📋 Выбрать мероприятие", 
+                                 callback_data="checkin_select_event", 
+                                 payload="checkin_select_event")
+                ).as_markup()]
+            )
+            return  
+
+        # 🔧 ИСПРАВЛЕНИЕ: обновляем состояние и в памяти, и в БД
+        user_states[user_id] = 'admin_checkin_await_qr'
+
+        try:
+            await db.save_user(
+                user_id=user_id,
+                state='admin_checkin_await_qr'
+            )
+        except Exception as e:
+            logger.error(f"Failed to update state in DB: {e}")  
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(
+            text="❌ Отмена",
+            callback_data="admin_checkin",
+            payload="admin_checkin"
+        ))  
+
+        await send_callback_response(
+            event,
+            "📷 Отправьте фото QR-кода участника\n\n"
+            "Бот распознает QR-код и отметит участника.\n"
+            "Для отмены нажмите кнопку ниже.",
+            [builder.as_markup()]
+        )
+
+    # Ручной ввод ID участника
+    elif callback_data == "checkin_manual_id":
+        if not admin_service.is_admin(user_id):
+            return
+
+        if not checkin_service.current_event_id:
+            await event.message.answer(
+                "❌ Сначала выберите мероприятие!",
+                attachments=[InlineKeyboardBuilder().row(
+                    CallbackButton(text="📋 Выбрать мероприятие", callback_data="checkin_select_event", payload="checkin_select_event")
+                ).as_markup()]
+            )
+            return
+
+        user_states[user_id] = 'admin_checkin_await_id'
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(
+            text="❌ Отмена",
+            callback_data="admin_checkin",
+            payload="admin_checkin"
+        ))
+
+        await event.message.answer(
+            "✏️ Введите ID участника (Lead ID):\n\n"
+            "Например: DP-A1B2C3D4 или 12345\n\n"
+            "Для отмены нажмите кнопку ниже.",
+            attachments=[builder.as_markup()]
+        )
+
+    # Назад в админ-панель (обновленная кнопка)
+    elif callback_data == "admin_back":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="📊 Статистика", callback_data="admin_stats", payload="admin_stats"))
+        builder.row(CallbackButton(text="📨 Рассылка", callback_data="admin_broadcast", payload="admin_broadcast"))
+        builder.row(CallbackButton(text="📈 История рассылок", callback_data="admin_history", payload="admin_history"))
+        builder.row(CallbackButton(text="📋 Отметка участников", callback_data="admin_checkin", payload="admin_checkin"))  # НОВАЯ КНОПКА
+        builder.row(CallbackButton(text="◀️ Назад в меню", callback_data="back_to_menu", payload="back_to_menu"))
+
+        await event.message.answer(
+            "🔧 Панель администратора\n\nВыберите действие:",
+            attachments=[builder.as_markup()]
+        )
+
+    # Подтверждение отметки участника
+    elif callback_data == "confirm_checkin":
+        if not admin_service.is_admin(user_id):
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+
+        lead_id = user_states.get(f"{user_id}_checkin_lead_id", "")
+
+        if not lead_id:
+            # Пробуем отправить сообщение через send_callback_response
+            await send_callback_response(
+                event,
+                "❌ Сессия истекла. Начните заново."
+            )
+            if user_id in user_states:
+                del user_states[user_id]
+            return
+
+        # Выполняем отметку
+        # Отправляем сообщение о начале
+        await send_callback_response(event, f"⏳ Отмечаем участника: {lead_id}...")
+
+        result = await checkin_service.check_in_by_lead_id(lead_id)
+
+        if result.success:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(
+                text="✏️ Ввести ещё ID",
+                callback_data="checkin_manual_id",
+                payload="checkin_manual_id"
+            ))
+            builder.row(CallbackButton(
+                text="📷 Сканировать QR",
+                callback_data="checkin_scan_qr",
+                payload="checkin_scan_qr"
+            ))
+            builder.row(CallbackButton(
+                text="◀️ Назад в меню отметки",
+                callback_data="admin_checkin",
+                payload="admin_checkin"
+            ))
+
+            # Получаем chat_id для отправки результата
+            chat_id = get_chat_id(event)
+            if chat_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{result.message}\n\n"
+                        f"🆔 ID: {result.lead_id}\n"
+                        f"📅 Мероприятие: {result.event_name}\n"
+                        f"🕐 Время: {result.timestamp.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                        "Можете отметить следующего участника:"
+                    ),
+                    attachments=[builder.as_markup()]
+                )
+        else:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(
+                text="✏️ Ввести другой ID",
+                callback_data="checkin_manual_id",
+                payload="checkin_manual_id"
+            ))
+            builder.row(CallbackButton(
+                text="◀️ Назад",
+                callback_data="admin_checkin",
+                payload="admin_checkin"
+            ))
+
+            chat_id = get_chat_id(event)
+            if chat_id:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ {result.message}\n\n"
+                        "Попробуйте ещё раз:"
+                    ),
+                    attachments=[builder.as_markup()]
+                )
+
+        # Очищаем временные данные
+        if f"{user_id}_checkin_lead_id" in user_states:
+            del user_states[f"{user_id}_checkin_lead_id"]
+
+        # Возвращаем состояние для возможности ввода нового ID
+        user_states[user_id] = 'admin_checkin_await_id'
+            
+            
 # ============= Обработчики обновлений =============
 
 @dp.bot_started()
@@ -1044,8 +1497,255 @@ async def handle_all_messages(event: MessageCreated):
             )
         return
     
-    state = user.get('state') or user_states.get(user_id, 'awaiting_phone')
-    logger.info(f"User {user_id} current state: {state}")
+    state = user_states.get(user_id) or (user.get('state') if user else 'awaiting_phone')
+    logger.info(f"User {user_id} current state: {state} (memory: {user_id in user_states}, db: {user.get('state') if user else 'None'})")
+    
+    # ========== ОБРАБОТКА ОТМЕТКИ УЧАСТНИКОВ ==========
+
+    if state == 'admin_checkin_confirm':
+        # Это состояние обрабатывается только через callback (confirm_checkin)
+        # Если сюда попали с текстом - игнорируем
+        await event.message.answer(
+            "⚠️ Используйте кнопки выше для подтверждения или отмены."
+        )
+        return
+
+    # Ожидание QR-кода от админа
+    if state == 'admin_checkin_await_qr':
+        if not config.bot.is_admin(user_id):
+            logger.warning(f"Non-admin user {user_id} in admin checkin state")
+            del user_states[user_id]
+            await event.message.answer("⛔ Доступ запрещен.")
+            return
+    
+        # Пытаемся скачать изображение из сообщения
+        image_bytes = await download_image_from_message(event.message)
+        
+        if not image_bytes:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(
+                text="❌ Отмена",
+                callback_data="admin_checkin",
+                payload="admin_checkin"
+            ))
+            await event.message.answer(
+                "📷 Пожалуйста, отправьте фото QR-кода.\n\n"
+                "Бот распознает QR-код и автоматически отметит участника.\n"
+                "Для отмены нажмите кнопку ниже.",
+                attachments=[builder.as_markup()]
+            )
+            return
+    
+        # Сообщаем о начале обработки
+        await event.message.answer("🔍 Распознаю QR-код...")
+    
+        try:
+            from qr_scanner import decode_qr_from_bytes, QR_AVAILABLE
+            
+            if not QR_AVAILABLE:
+                await event.message.answer(
+                    "⚠️ Библиотеки для распознавания QR-кодов не установлены.\n\n"
+                    "Введите ID участника вручную:",
+                    attachments=[InlineKeyboardBuilder().row(
+                        CallbackButton(text="✏️ Ввести ID вручную", 
+                                     callback_data="checkin_manual_id", 
+                                     payload="checkin_manual_id")
+                    ).as_markup()]
+                )
+                user_states[user_id] = 'admin_checkin_await_id'
+                return
+            
+            # Распознаём QR-код
+            qr_data = decode_qr_from_bytes(image_bytes)
+            
+            if qr_data:
+                logger.info(f"QR decoded: {qr_data}")
+                
+                # 🔧 ПРЕОБРАЗУЕМ URL в правильный формат
+                lead_id = checkin_service.extract_lead_id_from_qr(qr_data)
+                
+                if not lead_id:
+                    await event.message.answer(
+                        f"⚠️ Не удалось извлечь ID участника из QR-кода.\n\n"
+                        f"Распознано: {qr_data[:200]}\n\n"
+                        "Введите ID вручную:",
+                        attachments=[InlineKeyboardBuilder().row(
+                            CallbackButton(text="✏️ Ввести ID вручную", 
+                                         callback_data="checkin_manual_id", 
+                                         payload="checkin_manual_id")
+                        ).as_markup()]
+                    )
+                    user_states[user_id] = 'admin_checkin_await_id'
+                    return
+                
+                # 🔧 ФОРМИРУЕМ ПРАВИЛЬНЫЙ URL для отметки
+                # Варианты QR:
+                # 1. https://bitrix.neto.ru/?id=98839          → нужно /lead.php?leadid=98839
+                # 2. https://bitrix.neto.ru/lead.php?leadid=98839 → уже правильный
+                # 3. 98839                                       → просто ID
+                
+                if 'lead.php' in qr_data:
+                    # Уже правильный формат, используем как есть
+                    check_url = qr_data
+                else:
+                    # Формируем правильный URL
+                    check_url = f"https://bitrix.neto.ru/lead.php?leadid={lead_id}"
+                
+                logger.info(f"Using check URL: {check_url}")
+                
+                # Выполняем отметку
+                result = await checkin_service.check_in_participant(check_url)
+                
+                builder = InlineKeyboardBuilder()
+                builder.row(CallbackButton(
+                    text="📷 Сканировать ещё",
+                    callback_data="checkin_scan_qr",
+                    payload="checkin_scan_qr"
+                ))
+                builder.row(CallbackButton(
+                    text="✏️ Ввести ID вручную",
+                    callback_data="checkin_manual_id",
+                    payload="checkin_manual_id"
+                ))
+                builder.row(CallbackButton(
+                    text="◀️ Назад в меню отметки",
+                    callback_data="admin_checkin",
+                    payload="admin_checkin"
+                ))
+                
+                if result.success:
+                    await event.message.answer(
+                        f"✅ {result.message}\n\n"
+                        f"🆔 ID участника: {result.lead_id}\n"
+                        f"📅 Мероприятие: {result.event_name}\n"
+                        f"🕐 Время: {result.timestamp.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+                        "Можете отметить следующего участника:",
+                        attachments=[builder.as_markup()]
+                    )
+                else:
+                    await event.message.answer(
+                        f"❌ {result.message}\n\n"
+                        f"QR: {qr_data[:100]}\n"
+                        f"Lead ID: {lead_id}\n\n"
+                        "Попробуйте ещё раз или введите ID вручную.",
+                        attachments=[builder.as_markup()]
+                    )
+            else:
+                # QR не распознан
+                await event.message.answer(
+                    "❌ Не удалось распознать QR-код.\n\n"
+                    "📌 Рекомендации:\n"
+                    "• QR должен быть чётким и хорошо освещён\n"
+                    "• Держите камеру ровно\n"
+                    "• Сфотографируйте ближе\n\n"
+                    "Или введите ID вручную:",
+                    attachments=[InlineKeyboardBuilder().row(
+                        CallbackButton(text="📷 Попробовать снова", 
+                                     callback_data="checkin_scan_qr", 
+                                     payload="checkin_scan_qr")
+                    ).row(
+                        CallbackButton(text="✏️ Ввести ID вручную", 
+                                     callback_data="checkin_manual_id", 
+                                     payload="checkin_manual_id")
+                    ).row(
+                        CallbackButton(text="◀️ Назад", 
+                                     callback_data="admin_checkin", 
+                                     payload="admin_checkin")
+                    ).as_markup()]
+                )
+        
+        except Exception as e:
+            logger.error(f"Error processing QR: {e}\n{traceback.format_exc()}")
+            await event.message.answer(
+                f"❌ Ошибка: {str(e)}\n\nПопробуйте ещё раз или введите ID вручную."
+            )
+        
+        return
+
+    # Ожидание ID участника от админа
+    if state == 'admin_checkin_await_id':
+        if not config.bot.is_admin(user_id):
+            logger.warning(f"Non-admin user {user_id} in admin checkin state")
+            del user_states[user_id]
+            return
+
+        if not text:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(
+                text="❌ Отмена",
+                callback_data="admin_checkin",
+                payload="admin_checkin"
+            ))
+            await event.message.answer(
+                "✏️ Пожалуйста, введите ID участника:",
+                attachments=[builder.as_markup()]
+            )
+            return
+
+        lead_id = text.strip()
+
+        # Если ввели URL, извлекаем ID
+        if lead_id.startswith('http'):
+            extracted_id = checkin_service.extract_lead_id_from_qr(lead_id)
+            if extracted_id:
+                lead_id = extracted_id
+                logger.info(f"Extracted lead ID from URL: {lead_id}")
+
+        # Проверяем валидность ID
+        if not re.match(r'^[A-Za-z0-9\-_]+$', lead_id):
+            await event.message.answer(
+                "❌ Неверный формат ID участника.\n"
+                "ID должен содержать только буквы, цифры, дефисы и подчеркивания.\n\n"
+                "Попробуйте ещё раз:"
+            )
+            return
+
+        # Ищем лида для отображения информации
+        await event.message.answer(f"🔍 Ищу участника: {lead_id}...")
+
+        lead_data = await checkin_service.find_lead_by_id(lead_id)
+
+        # Сохраняем lead_id для подтверждения
+        user_states[f"{user_id}_checkin_lead_id"] = lead_id
+        user_states[user_id] = 'admin_checkin_confirm'
+
+        if lead_data:
+            # 🔧 Правильные поля из API: Leadid, Inn, Phone (имени нет)
+            lead_name = lead_data.get('name') or lead_data.get('NAME') or f"Участник {lead_id}"
+            lead_phone = lead_data.get('Phone') or lead_data.get('phone') or 'Нет данных'
+            lead_inn = lead_data.get('Inn') or lead_data.get('inn') or 'Нет данных'
+
+            message = (
+                f"👤 Найден участник:\n\n"
+                f"🆔 Lead ID: {lead_data.get('Leadid', lead_id)}\n"
+                f"📋 ID записи: {lead_data.get('id', 'N/A')}\n"
+                f"👨 Имя: {lead_name}\n"
+                f"📱 Телефон: {lead_phone}\n"
+                f"📋 ИНН: {lead_inn[:4] if lead_inn != 'Нет данных' else 'Нет данных'}****\n\n"
+                f"Мероприятие: {checkin_service.current_event_name}\n\n"
+                "Подтвердите отметку:"
+            )
+        else:
+            message = (
+                f"⚠️ Участник с ID {lead_id} не найден в списке.\n\n"
+                f"Мероприятие: {checkin_service.current_event_name}\n\n"
+                "Всё равно отметить?"
+            )
+
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(
+            text="✅ Подтвердить отметку",
+            callback_data="confirm_checkin",
+            payload="confirm_checkin"
+        ))
+        builder.row(CallbackButton(
+            text="❌ Отмена",
+            callback_data="admin_checkin",
+            payload="admin_checkin"
+        ))
+
+        await event.message.answer(message, attachments=[builder.as_markup()])
+        return
     
     # ========== ПРИОРИТЕТНАЯ ПРОВЕРКА: СОСТОЯНИЯ РАССЫЛКИ ==========
     
@@ -1594,6 +2294,7 @@ async def handle_all_messages(event: MessageCreated):
         return
     
     
+    
     # Fallback
     logger.warning(f"User {user_id} in unexpected state: {state}, sending fallback")
     keyboard = create_phone_keyboard()
@@ -1794,7 +2495,117 @@ async def send_qr_image(event, qr_bytes: bytes, bitrix_id: str, message_text: st
     await event.message.answer(
         f"{message_text}\n\n{qr_url}\n\n🆔 ID: {bitrix_id}"
     )
+
+async def get_image_from_message(message) -> Optional[bytes]:
+    """Извлечение изображения из сообщения"""
+    try:
+        if not hasattr(message, 'body') or not message.body:
+            return None
         
+        body = message.body
+        
+        # Проверяем attachments через model_dump
+        if hasattr(body, 'model_dump'):
+            body_dict = body.model_dump()
+        elif hasattr(body, 'dict'):
+            body_dict = body.dict()
+        else:
+            return None
+        
+        if 'attachments' in body_dict:
+            for att in body_dict['attachments']:
+                if isinstance(att, dict) and att.get('type') == 'image':
+                    payload = att.get('payload', {})
+                    image_url = payload.get('url')
+                    if image_url:
+                        async with httpx.AsyncClient() as client:
+                            response = await client.get(image_url)
+                            if response.status_code == 200:
+                                logger.info(f"Image downloaded: {len(response.content)} bytes")
+                                return response.content
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error extracting image: {e}")
+        return None
+    
+async def download_image_from_message(message) -> Optional[bytes]:
+    """
+    Скачивание изображения из сообщения
+    
+    Args:
+        message: объект сообщения MAX API
+        
+    Returns:
+        Байты изображения или None
+    """
+    try:
+        import httpx
+        
+        # Проверяем тело сообщения
+        if not hasattr(message, 'body') or not message.body:
+            logger.debug("No body in message")
+            return None
+        
+        body = message.body
+        
+        # Способ 1: через model_dump (самый надёжный)
+        if hasattr(body, 'model_dump'):
+            body_dict = body.model_dump()
+        elif hasattr(body, 'dict'):
+            body_dict = body.dict()
+        else:
+            logger.warning("Body has no model_dump/dict method")
+            return None
+        
+        # Ищем изображения в attachments
+        if 'attachments' in body_dict:
+            for att in body_dict['attachments']:
+                if isinstance(att, dict) and att.get('type') == 'image':
+                    payload = att.get('payload', {})
+                    
+                    # Пробуем получить URL изображения
+                    image_url = payload.get('url') or payload.get('file_url') or payload.get('link')
+                    
+                    if image_url:
+                        logger.info(f"Downloading image from: {image_url[:100]}...")
+                        
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            response = await client.get(image_url)
+                            if response.status_code == 200:
+                                logger.info(f"✅ Image downloaded: {len(response.content)} bytes")
+                                return response.content
+                            else:
+                                logger.warning(f"Failed to download image: HTTP {response.status_code}")
+        
+        # Способ 2: прямой перебор attachments (если есть)
+        if hasattr(body, 'attachments') and body.attachments:
+            for attachment in body.attachments:
+                if hasattr(attachment, 'type') and str(attachment.type) == 'image':
+                    if hasattr(attachment, 'payload'):
+                        payload = attachment.payload
+                        if hasattr(payload, 'url'):
+                            image_url = payload.url
+                        elif isinstance(payload, dict):
+                            image_url = payload.get('url')
+                        else:
+                            continue
+                        
+                        if image_url:
+                            async with httpx.AsyncClient(timeout=30.0) as client:
+                                response = await client.get(image_url)
+                                if response.status_code == 200:
+                                    logger.info(f"✅ Image downloaded: {len(response.content)} bytes")
+                                    return response.content
+        
+        logger.warning("No image URL found in message")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+        return None    
+    
 # ============= Запуск =============
 
 async def main():
